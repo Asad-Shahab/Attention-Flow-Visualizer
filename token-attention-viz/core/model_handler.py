@@ -6,11 +6,12 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='transformers.generation')
 
 class ModelHandler:
-    def __init__(self, model_name: str = None):
+    def __init__(self, model_name: str = None, config=None):
         self.model = None
         self.tokenizer = None
         self.device = None
         self.model_name = model_name
+        self.config = config
         
     def load_model(self, model_name: str = None) -> Tuple[bool, str]:
         """Load model with optimized settings"""
@@ -27,7 +28,17 @@ class ModelHandler:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             
             # Determine device and dtype
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            if self.config and hasattr(self.config, 'DEVICE'):
+                self.device = self.config.DEVICE
+                # If config specifies CPU, force it even if CUDA is available
+                if self.device == "cpu":
+                    print("Forcing CPU usage as specified in config")
+                elif self.device == "cuda" and not torch.cuda.is_available():
+                    print("CUDA requested but not available, falling back to CPU")
+                    self.device = "cpu"
+            else:
+                # Fallback to auto-detection if no config provided
+                self.device = "cuda" if torch.cuda.is_available() else "cpu"
             
             # Use bfloat16 for Ampere GPUs (compute capability >= 8.0), otherwise float32
             if self.device == "cuda" and torch.cuda.is_available():
@@ -44,13 +55,23 @@ class ModelHandler:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
                     torch_dtype=dtype,
+                    attn_implementation="eager"  # Force eager attention for attention extraction
                 ).to(self.device)
-                print(f"Model loaded on {self.device} with dtype {dtype}")
+                print(f"Model loaded on {self.device} with dtype {dtype} (eager attention)")
             except Exception as e:
                 print(f"Error loading model with specific dtype: {e}")
                 print("Attempting to load without specific dtype...")
-                self.model = AutoModelForCausalLM.from_pretrained(self.model_name).to(self.device)
-                print(f"Model loaded on {self.device} (default dtype)")
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_name,
+                        attn_implementation="eager"
+                    ).to(self.device)
+                    print(f"Model loaded on {self.device} (default dtype, eager attention)")
+                except Exception as e2:
+                    print(f"Error with eager attention: {e2}")
+                    print("Loading with default settings...")
+                    self.model = AutoModelForCausalLM.from_pretrained(self.model_name).to(self.device)
+                    print(f"Model loaded on {self.device} (default settings)")
             
             # Handle pad token
             if self.tokenizer.pad_token is None:

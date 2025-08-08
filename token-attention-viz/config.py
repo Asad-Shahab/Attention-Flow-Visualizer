@@ -4,8 +4,8 @@ from typing import Optional
 @dataclass
 class Config:
     # Model settings
-    DEFAULT_MODEL: str = "unsloth/Llama-3.2-1B-Instruct"
-    DEVICE: str = "cuda"  # Will auto-detect
+    DEFAULT_MODEL: str = "HuggingFaceTB/SmolLM-135M-Instruct"
+    DEVICE: str = "cpu"  # Force CPU usage
     
     # Generation settings
     DEFAULT_MAX_TOKENS: int = 20

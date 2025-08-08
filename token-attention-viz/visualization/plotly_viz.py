@@ -81,7 +81,9 @@ class AttentionVisualizer:
                     hoverinfo='text',
                     text=format_attention_text(input_labels[i], output_labels[j], weight),
                     hoverlabel=dict(bgcolor="lightskyblue", bordercolor="darkblue"),
-                    name=f"in_to_out_{i}_{j}"
+                    name=f"in_to_out_{i}_{j}",
+                    customdata=[(i, j)],
+                    hovertemplate="Input→Output %{customdata[0]}→%{customdata[1]}<extra></extra>"
                 )
                 traces.append(trace)
                 self.traces_info['input_to_output'].append({
@@ -141,6 +143,17 @@ class AttentionVisualizer:
                 color=self.config.INPUT_COLOR,
                 line=dict(width=self.config.NODE_LINE_WIDTH, color="darkblue")
             ),
+            selected=dict(
+                marker=dict(
+                    size=self.config.NODE_SIZE + 6,
+                    color="rgba(0, 0, 200, 0.9)"
+                )
+            ),
+            unselected=dict(
+                marker=dict(
+                    opacity=0.65
+                )
+            ),
             text=[truncate_token_label(label) for label in input_labels],
             textfont=dict(size=self.config.FONT_SIZE, family=self.config.FONT_FAMILY),
             textposition="middle left",
@@ -167,6 +180,17 @@ class AttentionVisualizer:
                 size=self.config.NODE_SIZE,
                 color=output_colors,
                 line=dict(width=self.config.NODE_LINE_WIDTH, color="darkred")
+            ),
+            selected=dict(
+                marker=dict(
+                    size=self.config.NODE_SIZE + 6,
+                    color="rgba(200, 80, 0, 0.9)"
+                )
+            ),
+            unselected=dict(
+                marker=dict(
+                    opacity=0.65
+                )
             ),
             text=[truncate_token_label(label) for label in output_labels],
             textfont=dict(size=self.config.FONT_SIZE, family=self.config.FONT_FAMILY),
@@ -200,10 +224,12 @@ class AttentionVisualizer:
                 fixedrange=True
             ),
             hovermode="closest",
+            clickmode="event+select",
+            dragmode="select",
             width=self.config.PLOT_WIDTH,
             height=max(self.config.PLOT_HEIGHT, num_input * 30, num_output * 30),
             plot_bgcolor="white",
-            margin=dict(l=150, r=150, t=80, b=80),
+            margin=dict(l=150, r=200, t=80, b=80),
             hoverdistance=20,
             hoverlabel=dict(font_size=12, font_family=self.config.FONT_FAMILY),
             showlegend=True,
@@ -211,7 +237,7 @@ class AttentionVisualizer:
                 yanchor="top",
                 y=0.99,
                 xanchor="left",
-                x=0.01
+                x=1.02
             ),
             # Preserve UI state on updates
             uirevision="constant"
