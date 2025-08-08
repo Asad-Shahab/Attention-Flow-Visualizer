@@ -1,0 +1,1205 @@
+%%capture
+!pip install torch transformers plotly dash imageio dash_bootstrap_components bertviz sentencepiece
+from google.colab import output
+output.enable_custom_widget_manager()
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import numpy as np
+import os
+import time
+import plotly.graph_objects as go
+from IPython.display import display, clear_output
+import ipywidgets as widgets
+import warnings
+import re
+
+warnings.filterwarnings("ignore", category=UserWarning, module='transformers.generation')
+
+def load_model(model_name="unsloth/Llama-3.2-1B-Instruct"):
+    print(f"Loading model: {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float32
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+        ).to(device)
+        print(f"Model loaded on {device} with dtype {dtype}")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("Attempting to load without specific dtype...")
+        model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        print(f"Model loaded on {device} (default dtype)")
+
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token:
+            print("Setting pad_token to eos_token")
+            tokenizer.pad_token = tokenizer.eos_token
+            if hasattr(model.config, 'pad_token_id') and model.config.pad_token_id is None:
+                 model.config.pad_token_id = tokenizer.eos_token_id
+        else:
+            print("Warning: No eos_token found to set as pad_token.")
+
+    return model, tokenizer, device
+
+def generate_with_attention(model, tokenizer, prompt, device, max_tokens=30):
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    input_len_raw = input_ids.shape[1]
+
+    print(f"Generating with input length: {input_len_raw}, max_new_tokens: {max_tokens}")
+    with torch.no_grad():
+        attention_mask = torch.ones_like(input_ids)
+        gen_kwargs = {
+             "attention_mask": attention_mask,
+             "max_new_tokens": max_tokens,
+             "output_attentions": True,
+             "return_dict_in_generate": True,
+        }
+        if tokenizer.pad_token_id is not None:
+             gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+
+        try:
+            output = model.generate(input_ids, **gen_kwargs)
+        except Exception as e:
+            print(f"Error during generation: {e}")
+            return None, [], [], 0, "Error during generation."
+
+    full_sequence = output.sequences[0]
+    if full_sequence.shape[0] > input_len_raw:
+         generated_ids = full_sequence[input_len_raw:]
+    else:
+         generated_ids = torch.tensor([], dtype=torch.long, device=device)
+
+    output_tokens = tokenizer.convert_ids_to_tokens(generated_ids, skip_special_tokens=False)
+    input_tokens_raw = tokenizer.convert_ids_to_tokens(input_ids[0], skip_special_tokens=False)
+
+    input_tokens = input_tokens_raw
+    input_len_for_attention = input_len_raw
+    bos_token = tokenizer.bos_token or '<|begin_of_text|>'
+
+    if input_tokens_raw and input_tokens_raw[0] == bos_token:
+         input_tokens = input_tokens_raw[1:]
+         input_len_for_attention = input_len_raw - 1
+
+    eos_token = tokenizer.eos_token or '<|end_of_text|>'
+    if output_tokens and output_tokens[-1] == eos_token:
+        output_tokens = output_tokens[:-1]
+        generated_ids = generated_ids[:-1]
+
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    attentions = getattr(output, 'attentions', None)
+    if attentions is None:
+        print("Warning: 'attentions' not found in model output. Cannot visualize attention.")
+        return None, output_tokens, input_tokens, input_len_for_attention, generated_text
+
+    return attentions, output_tokens, input_tokens, input_len_for_attention, generated_text
+
+def clean_label(token):
+    """Cleans token labels for visualization."""
+    label = str(token)
+    label = label.replace('Ġ', ' ')
+    label = label.replace(' ', ' ')
+    label = label.replace('Ċ', '\\n')
+    label = label.replace('</s>', '[EOS]')
+    label = label.replace('<unk>', '[UNK]')
+    label = label.replace('<|begin_of_text|>', '[BOS]')
+    label = label.replace('<|end_of_text|>', '[EOS]')
+    label = re.sub(r'<0x[0-9A-Fa-f]{2}>', '', label)
+    label = label.strip()
+    return label if label else "[EMPTY]"
+
+# --- Attention Processing Functions ---
+
+# Function to process attention with SEPARATE normalization
+def process_attention_flow_separate(attentions, input_len_for_attention, output_len):
+    if not attentions:
+        return [{'input_attention': torch.zeros(input_len_for_attention),
+                 'output_attention': None} for _ in range(output_len)]
+
+    attention_matrices = []
+    num_steps = len(attentions)
+    if num_steps == 0:
+        print("Warning: No attention steps found in output (Separate Norm).")
+        return [{'input_attention': torch.zeros(input_len_for_attention),
+                 'output_attention': None} for _ in range(output_len)]
+
+    steps_to_process = min(num_steps, output_len)
+
+    for i in range(steps_to_process):
+        step_attentions = attentions[i]
+        input_attention_layers = []
+        output_attention_layers = []
+
+        for layer_idx, layer_attn in enumerate(step_attentions):
+            try:
+                input_indices = slice(1, 1 + input_len_for_attention)
+                if layer_attn.shape[3] >= input_indices.stop:
+                    input_attn = layer_attn[0, :, 0, input_indices]
+                    input_attention_layers.append(input_attn)
+                    if i > 0:
+                        output_indices = slice(1 + input_len_for_attention, 1 + input_len_for_attention + i)
+                        if layer_attn.shape[3] >= output_indices.stop:
+                            output_attn = layer_attn[0, :, 0, output_indices]
+                            output_attention_layers.append(output_attn)
+                        else:
+                            output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+                else:
+                    input_attention_layers.append(torch.zeros((layer_attn.shape[1], input_len_for_attention), device=layer_attn.device))
+                    if i > 0:
+                        output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+            except Exception as e:
+                print(f"Error processing separate attention at step {i}, layer {layer_idx}: {e}")
+                input_attention_layers.append(torch.zeros((layer_attn.shape[1], input_len_for_attention), device=layer_attn.device))
+                if i > 0:
+                    output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+
+        if input_attention_layers:
+            avg_input_attn = torch.mean(torch.stack(input_attention_layers).float(), dim=[0, 1])
+        else:
+            avg_input_attn = torch.zeros(input_len_for_attention)
+
+        avg_output_attn = None
+        if i > 0 and output_attention_layers:
+            avg_output_attn = torch.mean(torch.stack(output_attention_layers).float(), dim=[0, 1])
+        elif i > 0:
+            avg_output_attn = torch.zeros(i)
+
+        input_sum = avg_input_attn.sum() + 1e-8
+        normalized_input_attn = avg_input_attn / input_sum
+
+        normalized_output_attn = None
+        if i > 0 and avg_output_attn is not None:
+            output_sum = avg_output_attn.sum() + 1e-8
+            normalized_output_attn = avg_output_attn / output_sum
+
+        attention_matrices.append({
+            'input_attention': normalized_input_attn.cpu(),
+            'output_attention': normalized_output_attn.cpu() if normalized_output_attn is not None else None,
+            'raw_input_attention': avg_input_attn.cpu(), # Keep raw for analysis
+            'raw_output_attention': avg_output_attn.cpu() if avg_output_attn is not None else None
+        })
+
+    while len(attention_matrices) < output_len:
+        attention_matrices.append({
+            'input_attention': torch.zeros(input_len_for_attention),
+            'output_attention': None,
+            'raw_input_attention': torch.zeros(input_len_for_attention),
+            'raw_output_attention': None
+        })
+    return attention_matrices
+
+# Function to process attention with JOINT normalization
+def process_attention_flow_joint(attentions, input_len_for_attention, output_len):
+    if not attentions:
+        return [{'input_attention': torch.zeros(input_len_for_attention),
+                 'output_attention': None} for _ in range(output_len)]
+
+    attention_matrices = []
+    num_steps = len(attentions)
+    if num_steps == 0:
+        print("Warning: No attention steps found in output (Joint Norm).")
+        return [{'input_attention': torch.zeros(input_len_for_attention),
+                 'output_attention': None} for _ in range(output_len)]
+
+    steps_to_process = min(num_steps, output_len)
+
+    for i in range(steps_to_process):
+        step_attentions = attentions[i]
+        input_attention_layers = []
+        output_attention_layers = []
+
+        for layer_idx, layer_attn in enumerate(step_attentions):
+            try:
+                input_indices = slice(1, 1 + input_len_for_attention)
+                if layer_attn.shape[3] >= input_indices.stop:
+                    input_attn = layer_attn[0, :, 0, input_indices]
+                    input_attention_layers.append(input_attn)
+                    if i > 0:
+                        output_indices = slice(1 + input_len_for_attention, 1 + input_len_for_attention + i)
+                        if layer_attn.shape[3] >= output_indices.stop:
+                            output_attn = layer_attn[0, :, 0, output_indices]
+                            output_attention_layers.append(output_attn)
+                        else:
+                            output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+                else:
+                    input_attention_layers.append(torch.zeros((layer_attn.shape[1], input_len_for_attention), device=layer_attn.device))
+                    if i > 0:
+                        output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+            except Exception as e:
+                print(f"Error processing joint attention at step {i}, layer {layer_idx}: {e}")
+                input_attention_layers.append(torch.zeros((layer_attn.shape[1], input_len_for_attention), device=layer_attn.device))
+                if i > 0:
+                    output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+
+        if input_attention_layers:
+            avg_input_attn = torch.mean(torch.stack(input_attention_layers).float(), dim=[0, 1])
+        else:
+            avg_input_attn = torch.zeros(input_len_for_attention)
+
+        avg_output_attn = None
+        if i > 0 and output_attention_layers:
+            avg_output_attn = torch.mean(torch.stack(output_attention_layers).float(), dim=[0, 1])
+        elif i > 0:
+            avg_output_attn = torch.zeros(i)
+
+        if i > 0 and avg_output_attn is not None:
+            combined_attn = torch.cat([avg_input_attn, avg_output_attn])
+            sum_attn = combined_attn.sum() + 1e-8
+            normalized_combined = combined_attn / sum_attn
+            normalized_input_attn = normalized_combined[:input_len_for_attention]
+            normalized_output_attn = normalized_combined[input_len_for_attention:]
+        else:
+            sum_attn = avg_input_attn.sum() + 1e-8
+            normalized_input_attn = avg_input_attn / sum_attn
+            normalized_output_attn = None
+
+        attention_matrices.append({
+            'input_attention': normalized_input_attn.cpu(),
+            'output_attention': normalized_output_attn.cpu() if normalized_output_attn is not None else None
+        })
+
+    while len(attention_matrices) < output_len:
+        attention_matrices.append({
+            'input_attention': torch.zeros(input_len_for_attention),
+            'output_attention': None
+        })
+
+    return attention_matrices
+
+
+# --- Visualization Creation Functions ---
+
+def create_flow_visualization_separate(input_tokens, output_tokens, attention_matrices, strong_threshold=0.05):
+    title = "Complete LLM Attention Flow Visualization (Separate Normalization)"
+    normalization_label = "Separately Normalized"
+
+    input_labels = [clean_label(token) for token in input_tokens]
+    output_labels = [clean_label(token) for token in output_tokens]
+    num_input = len(input_labels)
+    num_output = len(output_labels)
+    num_steps = len(attention_matrices)
+
+    if num_input == 0 or num_output == 0 or num_steps == 0:
+        print("Warning: No tokens or attention matrices to visualize (Separate Norm).")
+        fig = go.Figure()
+        fig.update_layout(title=f"{title} (No Data)", xaxis={'visible': False}, yaxis={'visible': False})
+        figw = go.FigureWidget(fig)
+        def dummy_update(step): pass
+        return figw, dummy_update
+
+    input_y = np.linspace(0.1, 0.9, num_input) if num_input > 1 else np.array([0.5])
+    output_y = np.linspace(0.1, 0.9, num_output) if num_output > 1 else np.array([0.5])
+    input_x = np.full(num_input, 0.1)
+    output_x = np.full(num_output, 0.9)
+    min_line_width, max_line_width = 0.5, 2.5
+
+    input_to_output_traces, input_to_output_info = [], []
+    for j in range(num_output):
+        for i in range(num_input):
+            conn_trace = go.Scatter(x=[input_x[i], output_x[j]], y=[input_y[i], output_y[j]], mode="lines", line=dict(color="rgba(0, 0, 255, 0.6)", width=min_line_width), opacity=0, showlegend=False, visible=True, hoverinfo='text', text=f"{input_labels[i]} → {output_labels[j]}Weight: 0.0000", hoverlabel=dict(bgcolor="lightskyblue", bordercolor="darkblue"), customdata=[(i, j)], name=f"sep_in_to_out_{i}_{j}")
+            input_to_output_traces.append(conn_trace)
+            input_to_output_info.append({'input_idx': i, 'output_idx': j, 'trace_idx': len(input_to_output_traces) - 1})
+
+    output_to_output_traces, output_to_output_info = [], []
+    control_x_offset = 0.15
+    for j in range(1, num_output):
+        for i in range(j):
+            path_x = [output_x[i], output_x[i] + control_x_offset, output_x[j] + control_x_offset, output_x[j]]
+            path_y = [output_y[i], output_y[i], output_y[j], output_y[j]]
+            conn_trace = go.Scatter(x=path_x, y=path_y, mode="lines", line=dict(color="rgba(255, 165, 0, 0.6)", width=min_line_width, shape='spline'), opacity=0, showlegend=False, visible=True, hoverinfo='text', text=f"{output_labels[i]} → {output_labels[j]}Weight: 0.0000", hoverlabel=dict(bgcolor="moccasin", bordercolor="darkorange"), customdata=[(i, j)], name=f"sep_out_to_out_{i}_{j}")
+            output_to_output_traces.append(conn_trace)
+            output_to_output_info.append({'from_idx': i, 'to_idx': j, 'trace_idx': len(input_to_output_traces) + len(output_to_output_traces) - 1})
+
+    # Make tokens clickable by adding customdata with indices
+    input_trace = go.Scatter(
+        x=input_x, y=input_y,
+        mode="markers+text",
+        marker=dict(size=15, color="skyblue", line=dict(width=1, color="darkblue")),
+        text=input_labels,
+        textfont=dict(size=10),
+        textposition="middle left",
+        name="Input Tokens",
+        hovertemplate="Input: %{text}<br>Click to show connections",
+        customdata=list(range(num_input))  # Add indices as customdata
+    )
+
+    output_trace = go.Scatter(
+        x=output_x, y=output_y,
+        mode="markers+text",
+        marker=dict(size=15, color=["rgba(230, 230, 230, 0.8)"] * num_output, line=dict(width=1, color="darkred")),
+        text=output_labels,
+        textfont=dict(size=10),
+        textposition="middle right",
+        name="Output Tokens",
+        hovertemplate="Output: %{text}<br>Click to show connections",
+        customdata=list(range(num_output))  # Add indices as customdata
+    )
+
+    data = input_to_output_traces + output_to_output_traces + [input_trace, output_trace]
+    fig = go.Figure(data=data)
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(range=[-0.1, 1.1], showgrid=False, zeroline=False, showticklabels=False, fixedrange=True),
+        yaxis=dict(range=[0, 1], showgrid=False, zeroline=False, showticklabels=False, fixedrange=True),
+        hovermode="closest", width=1000, height=max(600, num_input * 30, num_output * 20),
+        plot_bgcolor="white", margin=dict(l=120, r=120, t=50, b=50), hoverdistance=10,
+        hoverlabel=dict(font_size=12, font_family="Arial")
+    )
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', line=dict(color='rgba(0, 0, 255, 0.6)', width=2), name='Input→Output Attn'))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', line=dict(color='rgba(255, 165, 0, 0.6)', width=2, shape='spline'), name='Output→Output Attn'))
+
+    step_annotation = fig.add_annotation(x=0.5, y=0.02, text=f"Step 0 / {num_steps-1}: {clean_label(output_tokens[0]) if output_tokens else ''}", showarrow=False, font=dict(size=12, color="darkred"), xref="paper", yref="paper")
+    tooltip_annotation = fig.add_annotation(x=0.01, y=0.98, text="Click on tokens to show their connections", showarrow=False, font=dict(size=10, color="gray"), align="left", xref="paper", yref="paper")
+    text_annotation = fig.add_annotation(x=0.5, y=-0.05, text="Generated: ", showarrow=False, font=dict(size=12), xref="paper", yref="paper")
+    # Add status annotation for selection mode
+    selection_annotation = fig.add_annotation(x=0.99, y=0.98, text="No Selection", showarrow=False, font=dict(size=10, color="darkblue"), align="right", xref="paper", yref="paper")
+
+    figw = go.FigureWidget(fig)
+    input_node_trace_idx = len(input_to_output_traces) + len(output_to_output_traces)
+    output_node_trace_idx = input_node_trace_idx + 1
+
+    # Create variable to track the current visualization state
+    viz_state = {
+        'current_step': 0,
+        'selected_token': None,
+        'selected_token_type': None,
+        'show_all_connections': True
+    }
+
+    def filter_connections_for_token(token_type, token_idx):
+        """Show only connections related to the selected token"""
+        viz_state['selected_token'] = token_idx
+        viz_state['selected_token_type'] = token_type
+        viz_state['show_all_connections'] = False
+
+        with figw.batch_update():
+            # Update status annotation
+            token_text = input_labels[token_idx] if token_type == "input" else output_labels[token_idx]
+            figw.layout.annotations[3].text = f"Selected: {token_type.capitalize()} '{token_text}'"
+
+            # Reset all connection opacities first
+            for k in range(len(input_to_output_traces) + len(output_to_output_traces)):
+                figw.data[k].opacity = 0
+
+            # Handle input token selection
+            if token_type == "input":
+                # Show connections from this input token to all output tokens
+                for conn in input_to_output_info:
+                    if conn['input_idx'] == token_idx:
+                        output_idx = conn['output_idx']
+                        weight = attention_matrices[output_idx]['input_attention'][token_idx].item() if output_idx < len(attention_matrices) else 0
+                        if weight >= strong_threshold:
+                            trace_idx = conn['trace_idx']
+                            scaled_weight = min(1.0, weight * 5)
+                            figw.data[trace_idx].opacity = scaled_weight
+
+                # Highlight the selected input token
+                old_colors = figw.data[input_node_trace_idx].marker.color
+                new_colors = ["yellow" if i == token_idx else c for i, c in enumerate(old_colors)] if isinstance(old_colors, list) else ["yellow" if i == token_idx else "skyblue" for i in range(num_input)]
+                figw.data[input_node_trace_idx].marker.color = new_colors
+
+            # Handle output token selection
+            else:  # token_type == "output"
+                # Show connections from input tokens to this output token
+                for conn in input_to_output_info:
+                    if conn['output_idx'] == token_idx:
+                        input_idx = conn['input_idx']
+                        if token_idx < len(attention_matrices) and input_idx < len(attention_matrices[token_idx]['input_attention']):
+                            weight = attention_matrices[token_idx]['input_attention'][input_idx].item()
+                            if weight >= strong_threshold:
+                                trace_idx = conn['trace_idx']
+                                scaled_weight = min(1.0, weight * 5)
+                                figw.data[trace_idx].opacity = scaled_weight
+
+                # Show connections from previous output tokens to this output token
+                if token_idx > 0:
+                    for conn in output_to_output_info:
+                        if conn['to_idx'] == token_idx:
+                            from_idx = conn['from_idx']
+                            if token_idx < len(attention_matrices) and from_idx < len(attention_matrices[token_idx]['output_attention']):
+                                weight = attention_matrices[token_idx]['output_attention'][from_idx].item()
+                                if weight >= strong_threshold:
+                                    trace_idx = conn['trace_idx']
+                                    scaled_weight = min(1.0, weight * 5)
+                                    figw.data[trace_idx].opacity = scaled_weight
+
+                # Highlight the selected output token
+                old_colors = figw.data[output_node_trace_idx].marker.color
+                new_colors = ["yellow" if i == token_idx else ("lightpink" if i < token_idx else "rgba(230, 230, 230, 0.8)") for i in range(num_output)]
+                figw.data[output_node_trace_idx].marker.color = new_colors
+
+    def reset_selection():
+        """Reset to normal view showing all connections for current step"""
+        viz_state['selected_token'] = None
+        viz_state['selected_token_type'] = None
+        viz_state['show_all_connections'] = True
+
+        # Reset tokens to their normal colors
+        with figw.batch_update():
+            figw.layout.annotations[3].text = "No Selection"
+            figw.data[input_node_trace_idx].marker.color = "skyblue"
+            new_colors = ["lightcoral" if j == viz_state['current_step'] else ("lightpink" if j < viz_state['current_step'] else "rgba(230, 230, 230, 0.8)") for j in range(num_output)]
+            figw.data[output_node_trace_idx].marker.color = new_colors
+
+        # Update the visualization for the current step
+        update_visualization_separate_internal(viz_state['current_step'])
+
+    def update_visualization_separate_internal(step):
+        """Update the visualization to show connections for a specific step"""
+        viz_state['current_step'] = step
+
+        # If we have a token selected, show connections for that token
+        if not viz_state['show_all_connections'] and viz_state['selected_token'] is not None:
+            filter_connections_for_token(viz_state['selected_token_type'], viz_state['selected_token'])
+            return
+
+        # Otherwise show standard step visualization
+        if step == -1: # All Connections
+            with figw.batch_update():
+                figw.layout.annotations[0].text = "All Connections Above Threshold"
+                generated_so_far = " ".join([clean_label(token) for token in output_tokens])
+                figw.layout.annotations[2].text = f"Generated: {generated_so_far}"
+
+                # Reset all opacities first
+                for k in range(len(input_to_output_traces) + len(output_to_output_traces)):
+                    figw.data[k].opacity = 0
+
+                # Iterate through steps and apply thresholds
+                for j in range(num_output):
+                    current_attention = attention_matrices[j]
+                    # Input-to-Output
+                    if 'input_attention' in current_attention and current_attention['input_attention'] is not None:
+                        input_attn = current_attention['input_attention']
+                        max_input_weight = input_attn.max().item() if input_attn.numel() > 0 else 1.0
+                        if max_input_weight <= 1e-8: max_input_weight = 1.0
+                        for conn in input_to_output_info:
+                            i, out_j, trace_idx = conn['input_idx'], conn['output_idx'], conn['trace_idx']
+                            if out_j == j and i < len(input_attn):
+                                weight = input_attn[i].item()
+                                if weight >= strong_threshold:
+                                    scaled_weight = weight / max_input_weight
+                                    width = min_line_width + (max_line_width - min_line_width) * scaled_weight
+                                    opacity = min(1.0, scaled_weight * 5)
+                                    figw.data[trace_idx].line.width = width
+                                    figw.data[trace_idx].opacity = opacity
+                                    figw.data[trace_idx].text = f"{input_labels[i]} → {output_labels[j]}Weight: {weight:.6f}Step {j}{normalization_label}"
+
+                    # Output-to-Output
+                    if j > 0 and 'output_attention' in current_attention and current_attention['output_attention'] is not None:
+                        output_attn = current_attention['output_attention']
+                        max_output_weight = output_attn.max().item() if output_attn.numel() > 0 else 1.0
+                        if max_output_weight <= 1e-8: max_output_weight = 1.0
+                        for conn in output_to_output_info:
+                            from_idx, to_idx, trace_idx = conn['from_idx'], conn['to_idx'], conn['trace_idx']
+                            if to_idx == j and from_idx < len(output_attn):
+                                weight = output_attn[from_idx].item()
+                                if weight >= strong_threshold:
+                                    scaled_weight = weight / max_output_weight
+                                    width = min_line_width + (max_line_width - min_line_width) * scaled_weight
+                                    opacity = min(1.0, scaled_weight * 5)
+                                    figw.data[trace_idx].line.width = width
+                                    figw.data[trace_idx].opacity = opacity
+                                    figw.data[trace_idx].text = f"{output_labels[from_idx]} → {output_labels[to_idx]}Weight: {weight:.6f}Step {j}{normalization_label}"
+
+                figw.data[output_node_trace_idx].marker.color = ["lightcoral"] * num_output
+            return
+
+        if step >= num_steps or step < 0: return
+
+        with figw.batch_update():
+            figw.layout.annotations[0].text = f"Step {step} / {num_steps-1}: {clean_label(output_tokens[step])}"
+            generated_so_far = " ".join([clean_label(token) for token in output_tokens[:step+1]])
+            figw.layout.annotations[2].text = f"Generated: {generated_so_far}"
+
+            current_attention = attention_matrices[step]
+
+            # Update Input-to-Output Connections
+            if 'input_attention' in current_attention and current_attention['input_attention'] is not None:
+                input_attn = current_attention['input_attention']
+                max_input_weight = input_attn.max().item() if input_attn.numel() > 0 else 1.0
+                if max_input_weight <= 1e-8: max_input_weight = 1.0
+                for conn in input_to_output_info:
+                    trace_idx, i, j = conn['trace_idx'], conn['input_idx'], conn['output_idx']
+                    if j == step and i < len(input_attn):
+                        weight = input_attn[i].item()
+                        scaled_weight = weight / max_input_weight
+                        width = min_line_width + (max_line_width - min_line_width) * scaled_weight
+                        opacity = min(1.0, scaled_weight * 5)
+                        is_visible = weight >= strong_threshold
+                        figw.data[trace_idx].line.width = width
+                        figw.data[trace_idx].opacity = opacity if is_visible else 0
+                        figw.data[trace_idx].text = f"{input_labels[i]} → {output_labels[j]}Weight: {weight:.6f}{normalization_label}"
+                    else: figw.data[trace_idx].opacity = 0
+            else:
+                 for conn in input_to_output_info: figw.data[conn['trace_idx']].opacity = 0
+
+
+            # Update Output-to-Output Connections
+            if step > 0 and 'output_attention' in current_attention and current_attention['output_attention'] is not None:
+                output_attn = current_attention['output_attention']
+                max_output_weight = output_attn.max().item() if output_attn.numel() > 0 else 1.0
+                if max_output_weight <= 1e-8: max_output_weight = 1.0
+                for conn in output_to_output_info:
+                    trace_idx, from_idx, to_idx = conn['trace_idx'], conn['from_idx'], conn['to_idx']
+                    if to_idx == step and from_idx < len(output_attn):
+                        weight = output_attn[from_idx].item()
+                        scaled_weight = weight / max_output_weight
+                        width = min_line_width + (max_line_width - min_line_width) * scaled_weight
+                        opacity = min(1.0, scaled_weight * 5)
+                        is_visible = weight >= strong_threshold
+                        figw.data[trace_idx].line.width = width
+                        figw.data[trace_idx].opacity = opacity if is_visible else 0
+                        figw.data[trace_idx].text = f"{output_labels[from_idx]} → {output_labels[to_idx]}Weight: {weight:.6f}Step {j}{normalization_label}"
+                    else: figw.data[trace_idx].opacity = 0
+            else:
+                 for conn in output_to_output_info: figw.data[conn['trace_idx']].opacity = 0
+
+            # Update Output Node Highlighting
+            new_colors = ["lightcoral" if j == step else ("lightpink" if j < step else "rgba(230, 230, 230, 0.8)") for j in range(num_output)]
+            figw.data[output_node_trace_idx].marker.color = new_colors
+
+    # Setup click handlers for tokens
+    def input_token_click_handler(trace, points, state):
+        if not points.point_inds:
+            return
+        token_idx = points.point_inds[0]
+        filter_connections_for_token("input", token_idx)
+
+    def output_token_click_handler(trace, points, state):
+        if not points.point_inds:
+            return
+        token_idx = points.point_inds[0]
+        filter_connections_for_token("output", token_idx)
+
+    # Create a reset button
+    reset_button = widgets.Button(
+        description='Reset Selection',
+        button_style='info',
+        layout=widgets.Layout(width='150px')
+    )
+    reset_button.on_click(lambda b: reset_selection())
+
+    # Register click handlers
+    figw.data[input_node_trace_idx].on_click(input_token_click_handler)
+    figw.data[output_node_trace_idx].on_click(output_token_click_handler)
+
+    # Return both the figure widget, update function, and the reset button
+    return figw, update_visualization_separate_internal, reset_button
+
+
+def create_flow_visualization_joint(input_tokens, output_tokens, attention_matrices, strong_threshold=0.01):
+    title = "Complete LLM Attention Flow Visualization (Joint Normalization)"
+    normalization_label = "Jointly Normalized"
+
+    input_labels = [clean_label(token) for token in input_tokens]
+    output_labels = [clean_label(token) for token in output_tokens]
+    num_input = len(input_labels)
+    num_output = len(output_labels)
+    num_steps = len(attention_matrices)
+
+    if num_input == 0 or num_output == 0 or num_steps == 0:
+        print("Warning: No tokens or attention matrices to visualize (Joint Norm).")
+        fig = go.Figure()
+        fig.update_layout(title=f"{title} (No Data)", xaxis={'visible': False}, yaxis={'visible': False})
+        figw = go.FigureWidget(fig)
+        def dummy_update(step): pass
+        return figw, dummy_update, None
+
+    input_y = np.linspace(0.1, 0.9, num_input) if num_input > 1 else np.array([0.5])
+    output_y = np.linspace(0.1, 0.9, num_output) if num_output > 1 else np.array([0.5])
+    input_x = np.full(num_input, 0.1)
+    output_x = np.full(num_output, 0.9)
+    min_line_width, max_line_width = 0.5, 3.0
+
+    input_to_output_traces, input_to_output_info = [], []
+    for j in range(num_output):
+        for i in range(num_input):
+            conn_trace = go.Scatter(x=[input_x[i], output_x[j]], y=[input_y[i], output_y[j]], mode="lines", line=dict(color="rgba(0, 0, 255, 0.6)", width=min_line_width), opacity=0, showlegend=False, visible=True, hoverinfo='text', text=f"{input_labels[i]} → {output_labels[j]}Weight: 0.0000", hoverlabel=dict(bgcolor="lightskyblue", bordercolor="darkblue"), customdata=[(i, j)], name=f"joint_in_to_out_{i}_{j}")
+            input_to_output_traces.append(conn_trace)
+            input_to_output_info.append({'input_idx': i, 'output_idx': j, 'trace_idx': len(input_to_output_traces) - 1})
+
+    output_to_output_traces, output_to_output_info = [], []
+    control_x_offset = 0.15
+    for j in range(1, num_output):
+        for i in range(j):
+            path_x = [output_x[i], output_x[i] + control_x_offset, output_x[j] + control_x_offset, output_x[j]]
+            path_y = [output_y[i], output_y[i], output_y[j], output_y[j]]
+            conn_trace = go.Scatter(x=path_x, y=path_y, mode="lines", line=dict(color="rgba(255, 165, 0, 0.6)", width=min_line_width, shape='spline'), opacity=0, showlegend=False, visible=True, hoverinfo='text', text=f"{output_labels[i]} → {output_labels[j]}Weight: 0.0000", hoverlabel=dict(bgcolor="moccasin", bordercolor="darkorange"), customdata=[(i, j)], name=f"joint_out_to_out_{i}_{j}")
+            output_to_output_traces.append(conn_trace)
+            output_to_output_info.append({'from_idx': i, 'to_idx': j, 'trace_idx': len(input_to_output_traces) + len(output_to_output_traces) - 1})
+
+    # Make tokens clickable by adding customdata with indices
+    input_trace = go.Scatter(
+        x=input_x, y=input_y,
+        mode="markers+text",
+        marker=dict(size=15, color="skyblue", line=dict(width=1, color="darkblue")),
+        text=input_labels,
+        textfont=dict(size=10),
+        textposition="middle left",
+        name="Input Tokens",
+        hovertemplate="Input: %{text}<br>Click to show connections",
+        customdata=list(range(num_input))  # Add indices as customdata
+    )
+
+    output_trace = go.Scatter(
+        x=output_x, y=output_y,
+        mode="markers+text",
+        marker=dict(size=15, color=["rgba(230, 230, 230, 0.8)"] * num_output, line=dict(width=1, color="darkred")),
+        text=output_labels,
+        textfont=dict(size=10),
+        textposition="middle right",
+        name="Output Tokens",
+        hovertemplate="Output: %{text}<br>Click to show connections",
+        customdata=list(range(num_output))  # Add indices as customdata
+    )
+
+    data = input_to_output_traces + output_to_output_traces + [input_trace, output_trace]
+    fig = go.Figure(data=data)
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(range=[-0.1, 1.1], showgrid=False, zeroline=False, showticklabels=False, fixedrange=True),
+        yaxis=dict(range=[0, 1], showgrid=False, zeroline=False, showticklabels=False, fixedrange=True),
+        hovermode="closest", width=1000, height=max(600, num_input * 30, num_output * 20),
+        plot_bgcolor="white", margin=dict(l=120, r=120, t=50, b=50), hoverdistance=10,
+        hoverlabel=dict(font_size=12, font_family="Arial")
+    )
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', line=dict(color='rgba(0, 0, 255, 0.6)', width=2), name='Input→Output Attn'))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode='lines', line=dict(color='rgba(255, 165, 0, 0.6)', width=2, shape='spline'), name='Output→Output Attn'))
+
+    step_annotation = fig.add_annotation(x=0.5, y=0.02, text=f"Step 0 / {num_steps-1}: {clean_label(output_tokens[0]) if output_tokens else ''}", showarrow=False, font=dict(size=12, color="darkred"), xref="paper", yref="paper")
+    tooltip_annotation = fig.add_annotation(x=0.01, y=0.98, text="Click on tokens to show their connections", showarrow=False, font=dict(size=10, color="gray"), align="left", xref="paper", yref="paper")
+    text_annotation = fig.add_annotation(x=0.5, y=-0.05, text="Generated: ", showarrow=False, font=dict(size=12), xref="paper", yref="paper")
+    # Add status annotation for selection mode
+    selection_annotation = fig.add_annotation(x=0.99, y=0.98, text="No Selection", showarrow=False, font=dict(size=10, color="darkblue"), align="right", xref="paper", yref="paper")
+
+    figw = go.FigureWidget(fig)
+    input_node_trace_idx = len(input_to_output_traces) + len(output_to_output_traces)
+    output_node_trace_idx = input_node_trace_idx + 1
+
+    # Create variable to track the current visualization state
+    viz_state = {
+        'current_step': 0,
+        'selected_token': None,
+        'selected_token_type': None,
+        'show_all_connections': True
+    }
+
+    def filter_connections_for_token(token_type, token_idx):
+        """Show only connections related to the selected token"""
+        viz_state['selected_token'] = token_idx
+        viz_state['selected_token_type'] = token_type
+        viz_state['show_all_connections'] = False
+
+        with figw.batch_update():
+            # Update status annotation
+            token_text = input_labels[token_idx] if token_type == "input" else output_labels[token_idx]
+            figw.layout.annotations[3].text = f"Selected: {token_type.capitalize()} '{token_text}'"
+
+            # Reset all connection opacities first
+            for k in range(len(input_to_output_traces) + len(output_to_output_traces)):
+                figw.data[k].opacity = 0
+
+            # Handle input token selection
+            if token_type == "input":
+                # Show connections from this input token to all output tokens
+                for conn in input_to_output_info:
+                    if conn['input_idx'] == token_idx:
+                        output_idx = conn['output_idx']
+                        weight = attention_matrices[output_idx]['input_attention'][token_idx].item() if output_idx < len(attention_matrices) else 0
+                        if weight >= strong_threshold:
+                            trace_idx = conn['trace_idx']
+                            # For joint normalization, we can use the weight directly
+                            width = min_line_width + (max_line_width - min_line_width) * weight * 5
+                            opacity = min(1.0, weight * 10)
+                            figw.data[trace_idx].opacity = opacity
+                            figw.data[trace_idx].line.width = width
+
+                # Highlight the selected input token
+                old_colors = figw.data[input_node_trace_idx].marker.color
+                new_colors = ["yellow" if i == token_idx else c for i, c in enumerate(old_colors)] if isinstance(old_colors, list) else ["yellow" if i == token_idx else "skyblue" for i in range(num_input)]
+                figw.data[input_node_trace_idx].marker.color = new_colors
+
+            # Handle output token selection
+            else:  # token_type == "output"
+                # Show connections from input tokens to this output token
+                for conn in input_to_output_info:
+                    if conn['output_idx'] == token_idx:
+                        input_idx = conn['input_idx']
+                        if token_idx < len(attention_matrices) and input_idx < len(attention_matrices[token_idx]['input_attention']):
+                            weight = attention_matrices[token_idx]['input_attention'][input_idx].item()
+                            if weight >= strong_threshold:
+                                trace_idx = conn['trace_idx']
+                                width = min_line_width + (max_line_width - min_line_width) * weight * 5
+                                opacity = min(1.0, weight * 10)
+                                figw.data[trace_idx].opacity = opacity
+                                figw.data[trace_idx].line.width = width
+
+                # Show connections from previous output tokens to this output token
+                if token_idx > 0:
+                    for conn in output_to_output_info:
+                        if conn['to_idx'] == token_idx:
+                            from_idx = conn['from_idx']
+                            if token_idx < len(attention_matrices) and from_idx < len(attention_matrices[token_idx]['output_attention']):
+                                weight = attention_matrices[token_idx]['output_attention'][from_idx].item()
+                                if weight >= strong_threshold:
+                                    trace_idx = conn['trace_idx']
+                                    width = min_line_width + (max_line_width - min_line_width) * weight * 5
+                                    opacity = min(1.0, weight * 10)
+                                    figw.data[trace_idx].opacity = opacity
+                                    figw.data[trace_idx].line.width = width
+
+                # Highlight the selected output token
+                old_colors = figw.data[output_node_trace_idx].marker.color
+                new_colors = ["yellow" if i == token_idx else ("lightpink" if i < token_idx else "rgba(230, 230, 230, 0.8)") for i in range(num_output)]
+                figw.data[output_node_trace_idx].marker.color = new_colors
+
+    def reset_selection():
+        """Reset to normal view showing all connections for current step"""
+        viz_state['selected_token'] = None
+        viz_state['selected_token_type'] = None
+        viz_state['show_all_connections'] = True
+
+        # Reset tokens to their normal colors
+        with figw.batch_update():
+            figw.layout.annotations[3].text = "No Selection"
+            figw.data[input_node_trace_idx].marker.color = "skyblue"
+            new_colors = ["lightcoral" if j == viz_state['current_step'] else ("lightpink" if j < viz_state['current_step'] else "rgba(230, 230, 230, 0.8)") for j in range(num_output)]
+            figw.data[output_node_trace_idx].marker.color = new_colors
+
+        # Update the visualization for the current step
+        update_visualization_joint_internal(viz_state['current_step'])
+
+    def update_visualization_joint_internal(step):
+        """Update the visualization to show connections for a specific step"""
+        viz_state['current_step'] = step
+
+        # If we have a token selected, show connections for that token
+        if not viz_state['show_all_connections'] and viz_state['selected_token'] is not None:
+            filter_connections_for_token(viz_state['selected_token_type'], viz_state['selected_token'])
+            return
+
+        # Otherwise show standard step visualization
+        if step == -1: # All Connections
+            with figw.batch_update():
+                figw.layout.annotations[0].text = "All Connections Above Threshold"
+                generated_so_far = " ".join([clean_label(token) for token in output_tokens])
+                figw.layout.annotations[2].text = f"Generated: {generated_so_far}"
+
+                # Reset all opacities first
+                for k in range(len(input_to_output_traces) + len(output_to_output_traces)):
+                    figw.data[k].opacity = 0
+
+                # Iterate through steps and apply thresholds
+                for j in range(num_output):
+                    current_attention = attention_matrices[j]
+                    # Input-to-Output
+                    if 'input_attention' in current_attention and current_attention['input_attention'] is not None:
+                        input_attn = current_attention['input_attention']
+                        for conn in input_to_output_info:
+                            i, out_j, trace_idx = conn['input_idx'], conn['output_idx'], conn['trace_idx']
+                            if out_j == j and i < len(input_attn):
+                                weight = input_attn[i].item()
+                                if weight >= strong_threshold:
+                                    width = min_line_width + (max_line_width - min_line_width) * weight * 5
+                                    opacity = min(1.0, weight * 10)
+                                    figw.data[trace_idx].line.width = width
+                                    figw.data[trace_idx].opacity = opacity
+                                    figw.data[trace_idx].text = f"{input_labels[i]} → {output_labels[j]}Weight: {weight:.6f}Step {j}{normalization_label}"
+
+                    # Output-to-Output
+                    if j > 0 and 'output_attention' in current_attention and current_attention['output_attention'] is not None:
+                        output_attn = current_attention['output_attention']
+                        for conn in output_to_output_info:
+                            from_idx, to_idx, trace_idx = conn['from_idx'], conn['to_idx'], conn['trace_idx']
+                            if to_idx == j and from_idx < len(output_attn):
+                                weight = output_attn[from_idx].item()
+                                if weight >= strong_threshold:
+                                    width = min_line_width + (max_line_width - min_line_width) * weight * 5
+                                    opacity = min(1.0, weight * 10)
+                                    figw.data[trace_idx].line.width = width
+                                    figw.data[trace_idx].opacity = opacity
+                                    figw.data[trace_idx].text = f"{output_labels[from_idx]} → {output_labels[to_idx]}Weight: {weight:.6f}Step {j}{normalization_label}"
+
+                figw.data[output_node_trace_idx].marker.color = ["lightcoral"] * num_output
+            return
+
+        if step >= num_steps or step < 0: return
+
+        with figw.batch_update():
+            figw.layout.annotations[0].text = f"Step {step} / {num_steps-1}: {clean_label(output_tokens[step])}"
+            generated_so_far = " ".join([clean_label(token) for token in output_tokens[:step+1]])
+            figw.layout.annotations[2].text = f"Generated: {generated_so_far}"
+
+            current_attention = attention_matrices[step]
+
+            # Update Input-to-Output Connections
+            if 'input_attention' in current_attention and current_attention['input_attention'] is not None:
+                input_attn = current_attention['input_attention']
+                for conn in input_to_output_info:
+                    trace_idx, i, j = conn['trace_idx'], conn['input_idx'], conn['output_idx']
+                    if j == step and i < len(input_attn):
+                        weight = input_attn[i].item()
+                        width = min_line_width + (max_line_width - min_line_width) * weight * 5
+                        opacity = min(1.0, weight * 10)
+                        is_visible = weight >= strong_threshold
+                        figw.data[trace_idx].line.width = width
+                        figw.data[trace_idx].opacity = opacity if is_visible else 0
+                        figw.data[trace_idx].text = f"{input_labels[i]} → {output_labels[j]}Weight: {weight:.6f}{normalization_label}"
+                    else: figw.data[trace_idx].opacity = 0
+            else: # Hide all input connections
+                for conn in input_to_output_info: figw.data[conn['trace_idx']].opacity = 0
+
+            # Update Output-to-Output Connections
+            if step > 0 and 'output_attention' in current_attention and current_attention['output_attention'] is not None:
+                output_attn = current_attention['output_attention']
+                for conn in output_to_output_info:
+                    trace_idx, from_idx, to_idx = conn['trace_idx'], conn['from_idx'], conn['to_idx']
+                    if to_idx == step and from_idx < len(output_attn):
+                        weight = output_attn[from_idx].item()
+                        width = min_line_width + (max_line_width - min_line_width) * weight * 5
+                        opacity = min(1.0, weight * 10)
+                        is_visible = weight >= strong_threshold
+                        figw.data[trace_idx].line.width = width
+                        figw.data[trace_idx].opacity = opacity if is_visible else 0
+                        figw.data[trace_idx].text = f"{output_labels[from_idx]} → {output_labels[to_idx]}Weight: {weight:.6f}{normalization_label}"
+                    else: figw.data[trace_idx].opacity = 0
+            else: # Hide all output connections
+                for conn in output_to_output_info: figw.data[conn['trace_idx']].opacity = 0
+
+            new_colors = ["lightcoral" if j == step else ("lightpink" if j < step else "rgba(230, 230, 230, 0.8)") for j in range(num_output)]
+            figw.data[output_node_trace_idx].marker.color = new_colors
+
+    # Setup click handlers for tokens
+    def input_token_click_handler(trace, points, state):
+        if not points.point_inds:
+            return
+        token_idx = points.point_inds[0]
+        filter_connections_for_token("input", token_idx)
+
+    def output_token_click_handler(trace, points, state):
+        if not points.point_inds:
+            return
+        token_idx = points.point_inds[0]
+        filter_connections_for_token("output", token_idx)
+
+    # Create a reset button
+    reset_button = widgets.Button(
+        description='Reset Selection',
+        button_style='info',
+        layout=widgets.Layout(width='150px')
+    )
+    reset_button.on_click(lambda b: reset_selection())
+
+    # Register click handlers
+    figw.data[input_node_trace_idx].on_click(input_token_click_handler)
+    figw.data[output_node_trace_idx].on_click(output_token_click_handler)
+
+    # Return both the figure widget, update function, and the reset button
+    return figw, update_visualization_joint_internal, reset_button
+
+
+# Also update the process_attention_flow_joint function to match the return signature of the separate version
+# This ensures it has the required fields for token selection
+def process_attention_flow_joint(attentions, input_len_for_attention, output_len):
+    if not attentions:
+        return [{'input_attention': torch.zeros(input_len_for_attention),
+                 'output_attention': None,
+                 'raw_input_attention': torch.zeros(input_len_for_attention),
+                 'raw_output_attention': None} for _ in range(output_len)]
+
+    attention_matrices = []
+    num_steps = len(attentions)
+    if num_steps == 0:
+        print("Warning: No attention steps found in output (Joint Norm).")
+        return [{'input_attention': torch.zeros(input_len_for_attention),
+                 'output_attention': None,
+                 'raw_input_attention': torch.zeros(input_len_for_attention),
+                 'raw_output_attention': None} for _ in range(output_len)]
+
+    steps_to_process = min(num_steps, output_len)
+
+    for i in range(steps_to_process):
+        step_attentions = attentions[i]
+        input_attention_layers = []
+        output_attention_layers = []
+
+        for layer_idx, layer_attn in enumerate(step_attentions):
+            try:
+                input_indices = slice(1, 1 + input_len_for_attention)
+                if layer_attn.shape[3] >= input_indices.stop:
+                    input_attn = layer_attn[0, :, 0, input_indices]
+                    input_attention_layers.append(input_attn)
+                    if i > 0:
+                        output_indices = slice(1 + input_len_for_attention, 1 + input_len_for_attention + i)
+                        if layer_attn.shape[3] >= output_indices.stop:
+                            output_attn = layer_attn[0, :, 0, output_indices]
+                            output_attention_layers.append(output_attn)
+                        else:
+                            output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+                else:
+                    input_attention_layers.append(torch.zeros((layer_attn.shape[1], input_len_for_attention), device=layer_attn.device))
+                    if i > 0:
+                        output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+            except Exception as e:
+                print(f"Error processing joint attention at step {i}, layer {layer_idx}: {e}")
+                input_attention_layers.append(torch.zeros((layer_attn.shape[1], input_len_for_attention), device=layer_attn.device))
+                if i > 0:
+                    output_attention_layers.append(torch.zeros((layer_attn.shape[1], i), device=layer_attn.device))
+
+        if input_attention_layers:
+            avg_input_attn = torch.mean(torch.stack(input_attention_layers).float(), dim=[0, 1])
+        else:
+            avg_input_attn = torch.zeros(input_len_for_attention)
+
+        avg_output_attn = None
+        if i > 0 and output_attention_layers:
+            avg_output_attn = torch.mean(torch.stack(output_attention_layers).float(), dim=[0, 1])
+        elif i > 0:
+            avg_output_attn = torch.zeros(i)
+
+        if i > 0 and avg_output_attn is not None:
+            combined_attn = torch.cat([avg_input_attn, avg_output_attn])
+            sum_attn = combined_attn.sum() + 1e-8
+            normalized_combined = combined_attn / sum_attn
+            normalized_input_attn = normalized_combined[:input_len_for_attention]
+            normalized_output_attn = normalized_combined[input_len_for_attention:]
+        else:
+            sum_attn = avg_input_attn.sum() + 1e-8
+            normalized_input_attn = avg_input_attn / sum_attn
+            normalized_output_attn = None
+
+        attention_matrices.append({
+            'input_attention': normalized_input_attn.cpu(),
+            'output_attention': normalized_output_attn.cpu() if normalized_output_attn is not None else None,
+            'raw_input_attention': avg_input_attn.cpu(),
+            'raw_output_attention': avg_output_attn.cpu() if avg_output_attn is not None else None
+        })
+
+    while len(attention_matrices) < output_len:
+        attention_matrices.append({
+            'input_attention': torch.zeros(input_len_for_attention),
+            'output_attention': None,
+            'raw_input_attention': torch.zeros(input_len_for_attention),
+            'raw_output_attention': None
+        })
+
+    return attention_matrices
+
+
+
+def main():
+    DEFAULT_PROMPT = 'an old wizard was walking through the dense green forest when he saw'
+    DEFAULT_MAX_TOKENS = 20
+    DEFAULT_MODEL = "unsloth/Llama-3.2-1B-Instruct"
+    DEFAULT_THRESHOLD_SEPARATE = 0.05
+    DEFAULT_THRESHOLD_JOINT = 0.01
+    OUTPUT_DIR = "./attention_viz_output"
+
+    prompt_input = widgets.Textarea(
+        value=DEFAULT_PROMPT,
+        description='Prompt:',
+        layout=widgets.Layout(width='90%', height='80px')
+    )
+
+    max_tokens_input = widgets.IntText(
+        value=DEFAULT_MAX_TOKENS,
+        description='Max Tokens:',
+        layout=widgets.Layout(width='200px')
+    )
+
+    threshold_separate_input = widgets.FloatText(
+        value=DEFAULT_THRESHOLD_SEPARATE,
+        description='Threshold (Separate):',
+        step=0.001, # finer control
+        layout=widgets.Layout(width='250px')
+    )
+
+    threshold_joint_input = widgets.FloatText(
+        value=DEFAULT_THRESHOLD_JOINT,
+        description='Threshold (Joint):',
+        step=0.001, # finer control
+        layout=widgets.Layout(width='250px')
+    )
+
+    run_button = widgets.Button(
+        description='Generate & Visualize Both',
+        button_style='success',
+        layout=widgets.Layout(width='300px')
+    )
+
+    output_area = widgets.Output()
+    viz_area = widgets.Output()
+
+    input_widgets = widgets.VBox([
+        prompt_input,
+        widgets.HBox([max_tokens_input, threshold_separate_input, threshold_joint_input]),
+        run_button
+    ])
+    display(input_widgets, output_area, viz_area)
+
+    shared_step_dropdown = None
+    update_func_separate = None
+    update_func_joint = None
+
+    def run_visualization(b):
+        nonlocal shared_step_dropdown, update_func_separate, update_func_joint
+
+        with output_area:
+            clear_output(wait=True)
+            print("Starting visualization process...")
+
+        with viz_area:
+            clear_output(wait=True)
+
+        prompt = prompt_input.value
+
+        # Validate max_tokens
+        try:
+            max_tokens = int(max_tokens_input.value)
+            if max_tokens < 1: max_tokens = 1; max_tokens_input.value = 1
+            if max_tokens > 100: max_tokens = 100; max_tokens_input.value = 100
+        except (ValueError, TypeError):
+            max_tokens = DEFAULT_MAX_TOKENS
+            max_tokens_input.value = max_tokens
+            with output_area: print("Invalid max tokens value. Using default.")
+
+        # Validate threshold_separate
+        try:
+            threshold_separate = float(threshold_separate_input.value)
+            if not (0 <= threshold_separate <= 1.0):
+                 threshold_separate = DEFAULT_THRESHOLD_SEPARATE
+                 threshold_separate_input.value = threshold_separate
+                 with output_area: print("Invalid separate threshold. Clamped to [0, 1]. Using default.")
+        except (ValueError, TypeError):
+            threshold_separate = DEFAULT_THRESHOLD_SEPARATE
+            threshold_separate_input.value = threshold_separate
+            with output_area: print("Invalid separate threshold value. Using default.")
+
+        # Validate threshold_joint
+        try:
+            threshold_joint = float(threshold_joint_input.value)
+            if not (0 <= threshold_joint <= 1.0):
+                 threshold_joint = DEFAULT_THRESHOLD_JOINT
+                 threshold_joint_input.value = threshold_joint
+                 with output_area: print("Invalid joint threshold. Clamped to [0, 1]. Using default.")
+        except (ValueError, TypeError):
+            threshold_joint = DEFAULT_THRESHOLD_JOINT
+            threshold_joint_input.value = threshold_joint
+            with output_area: print("Invalid joint threshold value. Using default.")
+
+        if not prompt:
+            prompt = DEFAULT_PROMPT
+            prompt_input.value = prompt # Update UI
+            with output_area: print("Prompt is empty. Using default.")
+
+        with output_area:
+            print(f"Using Model: {DEFAULT_MODEL}")
+            print(f"Prompt: '{prompt}'")
+            print(f"Max Tokens: {max_tokens}")
+            print(f"Separate Norm Threshold: {threshold_separate:.4f}")
+            print(f"Joint Norm Threshold: {threshold_joint:.4f}")
+
+        try:
+            # 1. Load Model
+            model, tokenizer, device = load_model()
+
+            # 2. Generate Text & Attentions
+            print("Generating text and attentions...")
+            attentions, output_tokens, input_tokens, input_len, generated_text = generate_with_attention(
+                model, tokenizer, prompt, device, max_tokens
+            )
+
+            if attentions is None:
+                 with output_area: print("Generation failed or attentions not available. Cannot proceed.")
+                 return
+
+            with output_area:
+                print(f"\nInput Tokens ({len(input_tokens)}): {input_tokens}")
+                print(f"Output Tokens ({len(output_tokens)}): {output_tokens}")
+                print(f"\nGenerated text: {generated_text}\n")
+
+            if not output_tokens or not input_tokens:
+                with output_area: print("No input or output tokens were generated/found. Cannot create visualization.")
+                return
+
+            # 3. Process Attention (Both Methods)
+            with output_area: print("Processing attention weights (Separate Normalization)...")
+            attention_matrices_separate = process_attention_flow_separate(attentions, len(input_tokens), len(output_tokens))
+            with output_area: print(f"Created {len(attention_matrices_separate)} matrices for separate norm visualization.")
+
+            with output_area: print("Processing attention weights (Joint Normalization)...")
+            attention_matrices_joint = process_attention_flow_joint(attentions, len(input_tokens), len(output_tokens))
+            with output_area: print(f"Created {len(attention_matrices_joint)} matrices for joint norm visualization.")
+
+            # 4. Create Visualizations
+            with output_area: print("Creating visualizations...")
+            figw_separate, update_func_separate, reset_button_separate = create_flow_visualization_separate(
+                input_tokens, output_tokens, attention_matrices_separate, strong_threshold=threshold_separate
+            )
+            figw_joint, update_func_joint, reset_button_joint = create_flow_visualization_joint(
+                input_tokens, output_tokens, attention_matrices_joint, strong_threshold=threshold_joint
+            )
+
+            # 5. Create Display
+            num_steps = len(output_tokens)
+            step_options = [(f"Step {i}: {clean_label(output_tokens[i])}", i) for i in range(num_steps)]
+            step_options.append(("All Connections", -1))
+
+            shared_step_dropdown = widgets.Dropdown(
+                options=step_options,
+                value=0,
+                description='Step:',
+                layout=widgets.Layout(width='80%')
+            )
+
+            # Define the shared callback
+            def shared_dropdown_changed(change):
+                new_step = change['new']
+                if update_func_separate:
+                    update_func_separate(new_step)
+                if update_func_joint:
+                    update_func_joint(new_step)
+
+            # Link the callback
+            shared_step_dropdown.observe(shared_dropdown_changed, names='value')
+
+            if update_func_separate: update_func_separate(0)
+            if update_func_joint: update_func_joint(0)
+
+            with viz_area:
+                        display(widgets.VBox([
+                            widgets.HBox([shared_step_dropdown, reset_button_separate]),
+                            figw_separate,
+                            widgets.HBox([widgets.Label("Joint Visualization:"), reset_button_joint]),
+                            figw_joint
+                        ]))
+
+        except Exception as e:
+            with output_area:
+                print(f"\nAn error occurred during the process: {e}")
+                import traceback
+                traceback.print_exc()
+
+    run_button.on_click(run_visualization)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except NameError as e:
+        # Handle cases where run outside an ipython environment
+        if 'display' in str(e) or 'widgets' in str(e):
+            print("This script requires an environment like Jupyter Notebook/Lab or Google Colab")
+            print("with ipywidgets installed to display the interactive elements.")
+            print("Please run this script in such an environment.")
+        else:
+            # Re-raise other NameErrors
+            raise e
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
