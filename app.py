@@ -14,7 +14,7 @@ from core.cache import AttentionCache
 from config import Config
 from visualization.d3_viz import create_d3_visualization
 
-class TokenVisualizerApp:
+class AttentionFlowApp:
     def __init__(self):
         self.config = Config()
         self.model_handler = ModelHandler(config=self.config)
@@ -304,10 +304,10 @@ class TokenVisualizerApp:
 
 def create_gradio_interface():
     """Create the Gradio interface."""
-    app = TokenVisualizerApp()
+    app = AttentionFlowApp()
     
     with gr.Blocks(
-        title="Token Attention Visualizer",
+        title="Attention Flow Visualizer",
         css="""
         /* Default/Light mode styles */
         .main-header {
@@ -444,7 +444,7 @@ def create_gradio_interface():
     ) as demo:
         gr.HTML("""
             <div class="main-header">
-                <h1 class="main-title">Token Attention Visualizer</h1>
+                <h1 class="main-title">Attention Flow Visualizer</h1>
                 <p class="main-subtitle">Interactive visualization of attention patterns in Large Language Models</p>
             </div>
         """)

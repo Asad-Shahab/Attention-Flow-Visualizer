@@ -1,5 +1,5 @@
 ---
-title: Token Attention Visualizer
+title: Attention Flow Visualizer
 emoji: 🔍
 colorFrom: blue
 colorTo: green
@@ -8,9 +8,15 @@ sdk_version: 4.0.0
 app_file: app.py
 pinned: false
 license: apache-2.0
+tags:
+- attention
+- visualization
+- transformers
+- nlp
+- machine-learning
 ---
 
-# Token Attention Visualizer
+# Attention Flow Visualizer
 
 An interactive tool for visualizing attention patterns in Large Language Models during text generation.
 
@@ -18,7 +24,6 @@ An interactive tool for visualizing attention patterns in Large Language Models 
 
 - 🚀 **Real-time Generation**: Generate text with any Hugging Face model
 - 🔍 **Attention Visualization**: Explore attention patterns with clear visual representations
-- 📊 **Dual Normalization**: Choose between separate or joint attention normalization
 - ⚡ **Smart Caching**: Fast response with intelligent result caching
 - 🎯 **Token Selection**: Use dropdown menus to select and filter token connections
 - 📈 **Step Navigation**: Navigate through generation steps
@@ -28,7 +33,6 @@ An interactive tool for visualizing attention patterns in Large Language Models 
 
 The visualizer shows how tokens attend to each other during text generation:
 - **Blue lines**: Attention from input tokens to output tokens
-- **Orange curves**: Attention between output tokens
 - **Line thickness**: Represents attention weight strength
 
 ## Usage
@@ -51,8 +55,8 @@ The visualizer shows how tokens attend to each other during text generation:
 
 ```bash
 # Clone the repository
-git clone <repo-url>
-cd token-attention-viz
+git clone https://github.com/Asad-Shahab/attention-flow-visualizer
+cd attention-flow-visualizer
 
 # Install dependencies
 pip install -r requirements.txt
@@ -61,19 +65,9 @@ pip install -r requirements.txt
 python app.py
 ```
 
-## Deployment
-
-This app is designed for easy deployment on Hugging Face Spaces. Simply:
-1. Create a new Space
-2. Upload the project files
-3. The app will automatically start
-
 ## Requirements
 
 - Python 3.8+
 - 4GB+ RAM (SmolLM models are lightweight)
 - GPU acceleration optional (works well on CPU)
 
-## License
-
-Apache 2.0

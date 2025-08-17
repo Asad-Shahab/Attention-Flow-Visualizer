@@ -4,12 +4,12 @@ from typing import Optional
 @dataclass
 class Config:
     # Model settings
-    DEFAULT_MODEL: str = "HuggingFaceTB/SmolLM-135M-Instruct"
-    DEVICE: str = "cpu"  # Force CPU usage
+    DEFAULT_MODEL: str = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    DEVICE: str = "cpu"  
     
     # Generation settings
     DEFAULT_MAX_TOKENS: int = 20
-    DEFAULT_PROMPT: str = "The old wizard walked through the forest when he"
+    DEFAULT_PROMPT: str = "The old wizard dropped his staff when the wind howled, and it rolled into the dark cave"
     DEFAULT_TEMPERATURE: float = 0.7
     DEFAULT_TOP_P: float = 0.95
     
@@ -24,7 +24,7 @@ class Config:
     CONNECTION_COLOR: str = "rgba(128, 128, 128, 0.3)"
     
     # Cache settings
-    CACHE_SIZE: int = 10  # Number of generations to cache
+    CACHE_SIZE: int = 10  
     
     # UI settings
     PLOT_WIDTH: int = 1000
