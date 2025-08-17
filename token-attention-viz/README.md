@@ -17,10 +17,10 @@ An interactive tool for visualizing attention patterns in Large Language Models 
 ## Features
 
 - 🚀 **Real-time Generation**: Generate text with any Hugging Face model
-- 🔍 **Interactive Visualization**: Explore attention patterns with Plotly
+- 🔍 **Attention Visualization**: Explore attention patterns with clear visual representations
 - 📊 **Dual Normalization**: Choose between separate or joint attention normalization
 - ⚡ **Smart Caching**: Fast response with intelligent result caching
-- 🎯 **Token Filtering**: Click tokens to filter their connections
+- 🎯 **Token Selection**: Use dropdown menus to select and filter token connections
 - 📈 **Step Navigation**: Navigate through generation steps
 - 🎨 **Customizable Threshold**: Filter weak attention connections
 
@@ -33,17 +33,18 @@ The visualizer shows how tokens attend to each other during text generation:
 
 ## Usage
 
-1. **Load a Model**: Enter a Hugging Face model name (default: Llama-3.2-1B)
+1. **Load a Model**: Enter a Hugging Face model name (default: HuggingFaceTB/SmolLM-135M-Instruct)
 2. **Enter Prompt**: Type your input text
 3. **Configure Settings**: Adjust max tokens, temperature, and normalization
 4. **Generate**: Click to generate text and visualize attention
-5. **Interact**: Use controls to explore the attention patterns
+5. **Explore**: Use dropdown menus to select tokens and view their attention patterns
 
 ## Technical Details
 
 - Built with Gradio for the interface
-- Uses Plotly for interactive visualizations
+- Visualization system with dropdown-based token selection
 - Supports any Hugging Face causal language model
+- Optimized for smaller models like SmolLM for efficient deployment
 - Implements efficient attention processing and caching
 
 ## Local Development
@@ -70,8 +71,8 @@ This app is designed for easy deployment on Hugging Face Spaces. Simply:
 ## Requirements
 
 - Python 3.8+
-- CUDA-capable GPU (recommended)
-- 8GB+ RAM
+- 4GB+ RAM (SmolLM models are lightweight)
+- GPU acceleration optional (works well on CPU)
 
 ## License
 

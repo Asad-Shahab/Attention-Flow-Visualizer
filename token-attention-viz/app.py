@@ -646,9 +646,11 @@ if __name__ == "__main__":
     
     # Create and launch the app
     demo = create_gradio_interface()
-    demo.launch(
+    """ demo.launch(
         share=False,  # Set to True for public URL
         server_name="0.0.0.0",  # Allow external connections
         server_port=7860,  # Default Gradio port
         inbrowser=False  # Don't auto-open browser
-    )
+    ) """
+
+    demo.launch()
