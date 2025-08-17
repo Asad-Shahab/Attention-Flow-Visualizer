@@ -1,5 +1,4 @@
 import gradio as gr
-import plotly.graph_objects as go
 import torch
 import sys
 import os
@@ -12,75 +11,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 from core.model_handler import ModelHandler
 from core.attention import AttentionProcessor
 from core.cache import AttentionCache
-from visualization.plotly_viz import AttentionVisualizer
-from visualization.d3_viz import D3AttentionVisualizer
-from visualization.simple_svg_viz import SimpleSVGVisualizer
 from config import Config
+from visualization.d3_viz import create_d3_visualization
 
 class TokenVisualizerApp:
     def __init__(self):
         self.config = Config()
         self.model_handler = ModelHandler(config=self.config)
         self.cache = AttentionCache(max_size=self.config.CACHE_SIZE)
-        self.visualizer = AttentionVisualizer(self.config)
-        self.d3_visualizer = D3AttentionVisualizer(self.config)
-        self.svg_visualizer = SimpleSVGVisualizer(self.config)
         self.current_data = None
-        self.current_figure = None
         self.model_loaded = False
-        self.use_d3 = False  # Use simple SVG instead of D3
-        self.use_svg = True  # Use simple SVG visualization
         
-    def compute_overlay_css(self) -> str:
-        """Compute CSS to position overlay buttons over SVG nodes for Simple SVG mode."""
-        try:
-            if not self.current_data:
-                return "<style>#viz_container{position:relative;width:%dpx;height:%dpx;margin:0 auto;}</style>" % (self.config.PLOT_WIDTH, self.config.PLOT_HEIGHT)
-
-            input_tokens = self.current_data['input_tokens']
-            output_tokens = self.current_data['output_tokens']
-            width = self.config.PLOT_WIDTH
-            height = self.config.PLOT_HEIGHT
-            margin = 100  # must match simple_svg_viz
-
-            input_x = margin
-            output_x = width - margin
-
-            input_y_positions = []
-            output_y_positions = []
-            if len(input_tokens) > 0:
-                input_spacing = (height - 2 * margin) / max(1, len(input_tokens) - 1)
-                input_y_positions = [margin + i * input_spacing for i in range(len(input_tokens))]
-            if len(output_tokens) > 0:
-                output_spacing = (height - 2 * margin) / max(1, len(output_tokens) - 1)
-                output_y_positions = [margin + i * output_spacing for i in range(len(output_tokens))]
-
-            css_lines = [
-                "<style>",
-                f"#viz_container {{ position: relative; width: {width}px; height: {height}px; margin: 0 auto; }}",
-                ".overlay-btn { position: absolute; width: 28px; height: 28px; background: transparent; border: none; padding: 0; transform: translate(-50%, -50%); cursor: pointer; }",
-            ]
-
-            # Input buttons
-            for i in range(64):
-                if i < len(input_tokens):
-                    y = input_y_positions[i]
-                    css_lines.append(f"#btn_in_{i} {{ left: {input_x}px; top: {y}px; display: block; }}")
-                else:
-                    css_lines.append(f"#btn_in_{i} {{ display: none; }}")
-
-            # Output buttons
-            for j in range(64):
-                if j < len(output_tokens):
-                    y = output_y_positions[j]
-                    css_lines.append(f"#btn_out_{j} {{ left: {output_x}px; top: {y}px; display: block; }}")
-                else:
-                    css_lines.append(f"#btn_out_{j} {{ display: none; }}")
-
-            css_lines.append("</style>")
-            return "\n".join(css_lines)
-        except Exception:
-            return "<style>#viz_container{position:relative;width:%dpx;height:%dpx;margin:0 auto;}</style>" % (self.config.PLOT_WIDTH, self.config.PLOT_HEIGHT)
 
     def load_model(self, model_name: str = None) -> str:
         """Load the model and return status message."""
@@ -105,7 +46,7 @@ class TokenVisualizerApp:
         normalization: str,
         progress=gr.Progress()
     ):
-        """Main generation and visualization function."""
+        """Main generation function (no visualization)."""
         if not self.model_loaded:
             return None, "Please load a model first!", None
         
@@ -160,40 +101,6 @@ class TokenVisualizerApp:
             # Cache it
             self.cache.set(cache_key, self.current_data)
         
-        progress(0.8, desc="Creating visualization...")
-        
-        # Create visualization
-        if self.use_svg:
-            # Create simple SVG visualization
-            viz_html = self.svg_visualizer.create_visualization_html(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=len(self.current_data['output_tokens']) - 1
-            )
-            self.current_figure = viz_html
-        elif self.use_d3:
-            # Create D3 visualization HTML
-            viz_html = self.d3_visualizer.create_visualization_html(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=len(self.current_data['output_tokens']) - 1
-            )
-            self.current_figure = viz_html
-        else:
-            # Create Plotly visualization
-            self.current_figure = self.visualizer.create_interactive_plot(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=len(self.current_data['output_tokens']) - 1,
-                normalization=normalization
-            )
-        
         progress(1.0, desc="Complete!")
         
         # Create info text
@@ -201,238 +108,198 @@ class TokenVisualizerApp:
         info_text += f"🔤 Input tokens: {len(self.current_data['input_tokens'])}\n"
         info_text += f"🔤 Output tokens: {len(self.current_data['output_tokens'])}"
         
-        # Update step slider maximum
-        max_step = len(self.current_data['output_tokens']) - 1
-        
-        # Also provide input token choices for selector
-        input_choices = list(self.current_data['input_tokens'])
-        
         return (
-            self.current_figure,
             info_text,
-            gr.update(maximum=max_step, value=max_step),
-            gr.update(choices=input_choices, value=None)
         )
     
     def update_step(self, step_idx: int, threshold: float):
-        """Update visualization for different step."""
-        if not self.current_data or not self.current_figure:
-            return self.current_figure
-        
-        if self.use_svg:
-            # Recreate SVG visualization for new step
-            viz_html = self.svg_visualizer.create_visualization_html(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=step_idx
-            )
-            self.current_figure = viz_html
-            return viz_html
-        elif self.use_d3:
-            # Update current step
-            self.d3_visualizer.current_state['current_step'] = step_idx
-            
-            # Get selection state
-            selected_token = self.d3_visualizer.current_state.get('selected_token')
-            selected_type = self.d3_visualizer.current_state.get('selected_type')
-            
-            # Recreate D3 visualization for new step
-            viz_html = self.d3_visualizer.create_visualization_html(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=step_idx,
-                selected_token=selected_token,
-                selected_type=selected_type
-            )
-            self.current_figure = viz_html
-            return viz_html
-        else:
-            updated_fig = self.visualizer.update_for_step(
-                self.current_figure,
-                step_idx,
-                self.current_data['attention_matrices'],
-                self.current_data['output_tokens'],
-                threshold
-            )
-            return updated_fig
+        """No-op placeholder after removing visualization."""
+        return None
     
     def update_threshold(self, threshold: float, normalization: str):
-        """Update threshold and refresh visualization."""
-        if not self.current_data:
-            return self.current_figure
-        
-        if self.use_svg or self.use_d3:
-            # Get current state
-            current_step = self.d3_visualizer.current_state.get('current_step', len(self.current_data['output_tokens']) - 1)
-            selected_token = self.d3_visualizer.current_state.get('selected_token')
-            selected_type = self.d3_visualizer.current_state.get('selected_type')
-            
-            # Recreate D3 visualization with new threshold
-            viz_html = self.d3_visualizer.create_visualization_html(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=current_step,
-                selected_token=selected_token,
-                selected_type=selected_type
-            )
-            self.current_figure = viz_html
-            return viz_html
-        else:
-            # Recreate visualization with new threshold
-            step = self.visualizer.current_state['current_step']
-            self.current_figure = self.visualizer.create_interactive_plot(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=step,
-                normalization=normalization
-            )
-            return self.current_figure
+        """No-op placeholder after removing visualization."""
+        return None
     
     def filter_token_connections(self, token_idx: int, token_type: str, threshold: float):
-        """Filter connections for selected token."""
-        if not self.current_data or not self.current_figure:
-            return self.current_figure
-        
-        updated_fig = self.visualizer.filter_by_token(
-            self.current_figure,
-            token_idx,
-            token_type,
-            self.current_data['attention_matrices'],
-            threshold
-        )
-        
-        return updated_fig
+        """Removed visualization; keep placeholder."""
+        return None
     
     def reset_view(self, threshold: float):
-        """Reset to show all connections."""
-        if not self.current_data or not self.current_figure:
-            return self.current_figure
-        
-        if self.use_svg or self.use_d3:
-            # Get current state
-            current_step = self.d3_visualizer.current_state.get('current_step', len(self.current_data['output_tokens']) - 1)
-            
-            # Reset state
-            self.d3_visualizer.current_state['selected_token'] = None
-            self.d3_visualizer.current_state['selected_type'] = None
-            
-            # Recreate D3 visualization without selection
-            viz_html = self.d3_visualizer.create_visualization_html(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=current_step
-            )
-            self.current_figure = viz_html
-            return viz_html
-        else:
-            updated_fig = self.visualizer.show_all_connections(
-                self.current_figure,
-                self.current_data['attention_matrices'],
-                threshold
-            )
-            return updated_fig
+        """Removed visualization; keep placeholder."""
+        return None
 
     def on_d3_token_click(self, click_data: str, threshold: float):
-        """Handle token clicks from visualization."""
-        if not self.current_data or not self.current_figure or not click_data:
-            return self.current_figure, gr.update()
-        
-        try:
-            data = json.loads(click_data)
-            token_idx = data.get('index')
-            token_type = data.get('type')
-            
-            if token_idx is None or token_type is None:
-                return self.current_figure, gr.update()
-            
-            # Store state
-            self._current_step = getattr(self, '_current_step', len(self.current_data['output_tokens']) - 1)
-            self._selected_token = token_idx
-            self._selected_type = token_type
-            
-            if self.use_svg:
-                # Recreate SVG visualization with selected token
-                viz_html = self.svg_visualizer.create_visualization_html(
-                    self.current_data['input_tokens'],
-                    self.current_data['output_tokens'],
-                    self.current_data['attention_matrices'],
-                    threshold=threshold,
-                    initial_step=self._current_step,
-                    selected_token=token_idx,
-                    selected_type=token_type
-                )
-                self.current_figure = viz_html
-            elif self.use_d3:
-                # Get current step
-                current_step = self.d3_visualizer.current_state.get('current_step', len(self.current_data['output_tokens']) - 1)
-                
-                # Recreate D3 visualization with selected token
-                viz_html = self.d3_visualizer.create_visualization_html(
-                    self.current_data['input_tokens'],
-                    self.current_data['output_tokens'],
-                    self.current_data['attention_matrices'],
-                    threshold=threshold,
-                    initial_step=current_step,
-                    selected_token=token_idx,
-                    selected_type=token_type
-                )
-                self.current_figure = viz_html
-                self.d3_visualizer.current_state['selected_token'] = token_idx
-                self.d3_visualizer.current_state['selected_type'] = token_type
-            
-            # Update dropdown if input token was clicked
-            if token_type == 'input':
-                return self.current_figure, gr.update(value=self.current_data['input_tokens'][token_idx])
-            else:
-                return self.current_figure, gr.update()
-                
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            print(f"Error in token click handler: {e}")
-            return self.current_figure, gr.update()
+        """Removed visualization; keep placeholder for compatibility."""
+        return None, gr.update()
     
     def on_input_token_select(self, token_label: str, threshold: float):
-        """Filter connections when an input token is selected from dropdown."""
-        if not self.current_data or not self.current_figure:
-            return self.current_figure
-        if token_label is None or token_label == "":
-            return self.current_figure
-        try:
-            token_idx = self.current_data['input_tokens'].index(token_label)
-        except ValueError:
-            return self.current_figure
+        """Removed visualization; keep placeholder for compatibility."""
+        return None
+
+    def prepare_d3_data(self, step_idx: int, threshold: float = 0.01, filter_token: str = None):
+        """
+        Convert attention data to D3.js-friendly JSON format.
         
-        if self.use_svg or self.use_d3:
-            # Recreate D3 visualization with selected token
-            current_step = self.d3_visualizer.current_state.get('current_step', len(self.current_data['output_tokens']) - 1)
-            viz_html = self.d3_visualizer.create_visualization_html(
-                self.current_data['input_tokens'],
-                self.current_data['output_tokens'],
-                self.current_data['attention_matrices'],
-                threshold=threshold,
-                initial_step=current_step,
-                selected_token=token_idx,
-                selected_type='input'
-            )
-            self.current_figure = viz_html
-            return viz_html
-        else:
-            return self.visualizer.filter_by_token(
-                self.current_figure,
-                token_idx,
-                'input',
-                self.current_data['attention_matrices'],
-                threshold
-            )
+        Args:
+            step_idx: Generation step to visualize (0-based)
+            threshold: Minimum attention weight to include
+            filter_token: Token to filter by (format: "[IN] token" or "[OUT] token" or "All tokens")
+            
+        Returns:
+            dict: JSON structure with nodes and links for D3.js
+        """
+        if not self.current_data:
+            return {"nodes": [], "links": []}
+        
+        input_tokens = self.current_data['input_tokens']
+        output_tokens = self.current_data['output_tokens']
+        attention_matrices = self.current_data['attention_matrices']
+        
+        # Ensure step_idx is within bounds
+        if step_idx >= len(attention_matrices):
+            step_idx = len(attention_matrices) - 1
+        
+        attention_matrix = attention_matrices[step_idx]
+        
+        # Create nodes
+        nodes = []
+        
+        # Add input nodes
+        for i, token in enumerate(input_tokens):
+            nodes.append({
+                "id": f"input_{i}",
+                "token": token,
+                "type": "input",
+                "index": i
+            })
+        
+        # Add output nodes (up to current step)
+        for i in range(step_idx + 1):
+            if i < len(output_tokens):
+                nodes.append({
+                    "id": f"output_{i}",
+                    "token": output_tokens[i],
+                    "type": "output",
+                    "index": i
+                })
+        
+        # Parse filter token
+        filter_type = None
+        filter_idx = None
+        if filter_token and filter_token != "All tokens":
+            if filter_token.startswith("[IN] "):
+                filter_type = "input"
+                filter_token_text = filter_token[5:]  # Remove "[IN] " prefix
+                filter_idx = next((i for i, token in enumerate(input_tokens) if token == filter_token_text), None)
+            elif filter_token.startswith("[OUT] "):
+                filter_type = "output"
+                filter_token_text = filter_token[6:]  # Remove "[OUT] " prefix
+                filter_idx = next((i for i, token in enumerate(output_tokens) if token == filter_token_text), None)
+        
+        # Create links from attention matrices - show ALL steps up to current step
+        links = []
+        
+        # Show connections for all steps up to and including step_idx
+        for current_step in range(step_idx + 1):
+            if current_step < len(attention_matrices):
+                step_attention = attention_matrices[current_step]
+                
+                # Links from input tokens to this output token
+                input_attention = step_attention['input_attention']
+                if input_attention is not None:
+                    for input_idx in range(len(input_tokens)):
+                        if input_idx < len(input_attention):  # Check bounds
+                            weight = float(input_attention[input_idx])
+                            if weight >= threshold:
+                                # Apply filtering
+                                show_link = True
+                                if filter_type == "input" and filter_idx is not None:
+                                    # Only show connections involving the selected input token
+                                    show_link = (input_idx == filter_idx)
+                                elif filter_type == "output" and filter_idx is not None:
+                                    # Only show connections involving the selected output token
+                                    show_link = (current_step == filter_idx)
+                                
+                                if show_link:
+                                    links.append({
+                                        "source": f"input_{input_idx}",
+                                        "target": f"output_{current_step}",
+                                        "weight": weight,
+                                        "type": "input_to_output"
+                                    })
+                
+                # Links from previous output tokens to this output token
+                output_attention = step_attention['output_attention']
+                if output_attention is not None and current_step > 0:
+                    for prev_output_idx in range(current_step):
+                        if prev_output_idx < len(output_attention):  # Check bounds
+                            weight = float(output_attention[prev_output_idx])
+                            if weight >= threshold:
+                                # Apply filtering
+                                show_link = True
+                                if filter_type == "input" and filter_idx is not None:
+                                    # Don't show output-to-output connections when filtering by input
+                                    show_link = False
+                                elif filter_type == "output" and filter_idx is not None:
+                                    # Only show connections involving the selected output token
+                                    show_link = (prev_output_idx == filter_idx or current_step == filter_idx)
+                                
+                                if show_link:
+                                    links.append({
+                                        "source": f"output_{prev_output_idx}",
+                                        "target": f"output_{current_step}",
+                                        "weight": weight,
+                                        "type": "output_to_output"
+                                    })
+        
+        return {
+            "nodes": nodes,
+            "links": links,
+            "step": step_idx,
+            "total_steps": len(attention_matrices),
+            "input_count": len(input_tokens),
+            "output_count": step_idx + 1
+        }
+
+    def create_d3_visualization_html(self, step_idx: int = 0, threshold: float = 0.01, filter_token: str = None):
+        """
+        Create D3.js visualization HTML for the current data.
+        
+        Args:
+            step_idx: Generation step to visualize (0-based)
+            threshold: Minimum attention weight to include
+            filter_token: Token to filter by (format: "[IN] token" or "[OUT] token")
+            
+        Returns:
+            str: HTML string for D3.js visualization
+        """
+        if not self.current_data:
+            return "<div>No data available. Generate text first!</div>"
+        
+        d3_data = self.prepare_d3_data(step_idx, threshold, filter_token)
+        
+        viz_html = create_d3_visualization(d3_data)
+        return viz_html
+
+    def get_token_choices(self):
+        """
+        Get list of token choices for dropdown.
+        
+        Returns:
+            list: List of token strings for dropdown options
+        """
+        if not self.current_data:
+            return []
+        
+        input_tokens = self.current_data['input_tokens']
+        output_tokens = self.current_data['output_tokens']
+        
+        # Create choices with prefixes to distinguish input/output
+        choices = ["All tokens"]
+        choices.extend([f"[IN] {token}" for token in input_tokens])
+        choices.extend([f"[OUT] {token}" for token in output_tokens])
+        
+        return choices
 
 
 def create_gradio_interface():
@@ -441,58 +308,181 @@ def create_gradio_interface():
     
     with gr.Blocks(
         title="Token Attention Visualizer",
-        theme=gr.themes.Soft(),
         css="""
-        .container { max-width: 1400px; margin: auto; }
-        .plot-container { min-height: 600px; }
+        /* Default/Light mode styles */
+        .main-header {
+            text-align: center;
+            padding: 2rem 0 3rem 0;
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            border-radius: 1rem;
+            margin-bottom: 2rem;
+            border: 1px solid #e2e8f0;
+        }
+        
+        .main-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #1e293b;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, #1e293b 0%, #3b82f6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .main-subtitle {
+            font-size: 1.125rem;
+            color: #64748b;
+            font-weight: 400;
+        }
+        
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #1e293b;
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        
+        /* Explicit light mode overrides */
+        .light .main-header,
+        [data-theme="light"] .main-header {
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            border: 1px solid #e2e8f0;
+        }
+        
+        .light .main-title,
+        [data-theme="light"] .main-title {
+            color: #1e293b;
+            background: linear-gradient(135deg, #1e293b 0%, #3b82f6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .light .main-subtitle,
+        [data-theme="light"] .main-subtitle {
+            color: #64748b;
+        }
+        
+        .light .section-title,
+        [data-theme="light"] .section-title {
+            color: #1e293b;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        
+        /* Dark mode styles with higher specificity */
+        .dark .main-header,
+        [data-theme="dark"] .main-header {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%) !important;
+            border: 1px solid #475569 !important;
+        }
+        
+        .dark .main-title,
+        [data-theme="dark"] .main-title {
+            color: #f1f5f9 !important;
+            background: linear-gradient(135deg, #f1f5f9 0%, #60a5fa 100%) !important;
+            -webkit-background-clip: text !important;
+            -webkit-text-fill-color: transparent !important;
+            background-clip: text !important;
+        }
+        
+        .dark .main-subtitle,
+        [data-theme="dark"] .main-subtitle {
+            color: #cbd5e1 !important;
+        }
+        
+        .dark .section-title,
+        [data-theme="dark"] .section-title {
+            color: #f1f5f9 !important;
+            border-bottom: 2px solid #475569 !important;
+        }
+        
+        /* System dark mode - only apply when no explicit theme is set */
+        @media (prefers-color-scheme: dark) {
+            :root:not([data-theme="light"]) .main-header {
+                background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+                border: 1px solid #475569;
+            }
+            
+            :root:not([data-theme="light"]) .main-title {
+                color: #f1f5f9;
+                background: linear-gradient(135deg, #f1f5f9 0%, #60a5fa 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+            }
+            
+            :root:not([data-theme="light"]) .main-subtitle {
+                color: #cbd5e1;
+            }
+            
+            :root:not([data-theme="light"]) .section-title {
+                color: #f1f5f9;
+                border-bottom: 2px solid #475569;
+            }
+        }
+        
+        .load-model-btn {
+            background: linear-gradient(135deg, #f97316 0%, #ea580c 100%) !important;
+            color: white !important;
+            border: none !important;
+            font-weight: 600 !important;
+            padding: 0.75rem 2rem !important;
+            border-radius: 0.5rem !important;
+            box-shadow: 0 4px 6px -1px rgba(249, 115, 22, 0.25) !important;
+            transition: all 0.2s ease !important;
+        }
+        
+        .load-model-btn:hover {
+            background: linear-gradient(135deg, #ea580c 0%, #dc2626 100%) !important;
+            transform: translateY(-1px) !important;
+            box-shadow: 0 6px 8px -1px rgba(249, 115, 22, 0.35) !important;
+        }
         """
     ) as demo:
-        gr.Markdown(
-            """
-            # 🔍 Token Attention Visualizer
-            
-            Interactive visualization of attention patterns in Large Language Models.
-            See how tokens attend to each other during text generation!
-            """
-        )
+        gr.HTML("""
+            <div class="main-header">
+                <h1 class="main-title">Token Attention Visualizer</h1>
+                <p class="main-subtitle">Interactive visualization of attention patterns in Large Language Models</p>
+            </div>
+        """)
         
-        # Model loading section
         with gr.Row():
-            with gr.Column(scale=3):
+            # Left Panel - Controls
+            with gr.Column(scale=1):
+                gr.HTML('<h2 class="section-title">Model & Generation</h2>')
+                
+                # Model loading
                 model_input = gr.Textbox(
                     label="Model Name",
                     value=app.config.DEFAULT_MODEL,
                     placeholder="Enter Hugging Face model name..."
                 )
-            with gr.Column(scale=1):
-                load_model_btn = gr.Button("Load Model", variant="primary")
-        
-        model_status = gr.Textbox(
-            label="Model Status",
-            value="No model loaded",
-            interactive=False,
-            lines=3
-        )
-        
-        gr.Markdown("---")
-        
-        # Generation controls
-        with gr.Row():
-            with gr.Column(scale=2):
+                load_model_btn = gr.Button("Load Model", variant="primary", elem_classes=["load-model-btn"])
+                
+                model_status = gr.Textbox(
+                    label="Model Status",
+                    value="No model loaded",
+                    interactive=False,
+                    lines=2
+                )
+                
+                # Generation controls
                 prompt_input = gr.Textbox(
                     label="Prompt",
                     value=app.config.DEFAULT_PROMPT,
                     lines=3,
                     placeholder="Enter your prompt here..."
                 )
-            
-            with gr.Column(scale=1):
+                
                 max_tokens_input = gr.Slider(
                     minimum=1,
                     maximum=50,
                     value=app.config.DEFAULT_MAX_TOKENS,
                     step=1,
-                    label="Max Tokens to Generate"
+                    label="Max Tokens"
                 )
                 
                 temperature_input = gr.Slider(
@@ -503,90 +493,56 @@ def create_gradio_interface():
                     label="Temperature"
                 )
                 
-                normalization_input = gr.Radio(
-                    choices=["separate", "joint"],
-                    value="separate",
-                    label="Normalization Method",
-                    info="Separate: normalize input/output independently | Joint: normalize together"
+                generate_btn = gr.Button("Generate", variant="primary", size="lg")
+                
+                generated_info = gr.Textbox(
+                    label="Generation Info",
+                    interactive=False,
+                    lines=4
                 )
-        
-        generate_btn = gr.Button("🚀 Generate & Visualize", variant="primary", size="lg")
-        
-        # Results section
-        with gr.Row():
-            generated_info = gr.Textbox(
-                label="Generation Info",
-                interactive=False,
-                lines=3
-            )
-        
-        # Visualization controls
-        with gr.Row():
-            with gr.Column(scale=1):
-                threshold_input = gr.Slider(
-                    minimum=0.0,
-                    maximum=0.2,
-                    value=app.config.DEFAULT_THRESHOLD,
-                    step=0.001,
-                    label="Attention Threshold",
-                    info="Hide connections below this weight"
-                )
-            
-            with gr.Column(scale=1):
+                
+                gr.HTML('<h2 class="section-title">Visualization Controls</h2>')
+                
                 step_slider = gr.Slider(
                     minimum=0,
-                    maximum=20,
+                    maximum=10,
                     value=0,
                     step=1,
                     label="Generation Step",
                     info="Navigate through generation steps"
                 )
+                
+                threshold_slider = gr.Slider(
+                    minimum=0.001,
+                    maximum=0.5,
+                    value=0.01,
+                    step=0.001,
+                    label="Attention Threshold", 
+                    info="Filter weak connections"
+                )
+                
+                token_dropdown = gr.Dropdown(
+                    choices=["All tokens"],
+                    value="All tokens",
+                    label="Filter by Token",
+                    info="Select a token to highlight"
+                )
             
-            with gr.Column(scale=1):
-                with gr.Row():
-                    reset_btn = gr.Button("🔄 Reset View", size="sm")
-                    # Token selection would be handled through plot clicks
-            with gr.Column(scale=1):
-                input_token_selector = gr.Dropdown(
-                    label="Filter by Input Token",
-                    choices=[],
-                    interactive=True,
-                    allow_custom_value=False
+            # Right Panel - Visualization
+            with gr.Column(scale=2):
+                gr.HTML('<h2 class="section-title">Attention Visualization</h2>')
+                
+                d3_visualization = gr.HTML(
+                    value="""<div style='height: 700px; display: flex; align-items: center; justify-content: center; font-size: 16px;'>
+                        <div style='text-align: center;'>
+                            <div style='font-size: 3rem; margin-bottom: 16px; opacity: 0.5;'>⚪</div>
+                            <div style='font-weight: 500; margin-bottom: 8px;'>Ready to visualize</div>
+                            <div>Generate text to see attention patterns</div>
+                        </div>
+                    </div>"""
                 )
         
-        # Main visualization - use HTML for D3
-        viz_output = gr.HTML(
-            label="Attention Visualization",
-            elem_classes="viz-container"
-        )
-
-        # Overlay container: CSS and invisible buttons positioned over SVG nodes (Simple SVG path)
-        with gr.Column(elem_id="viz_container"):
-            # CSS placeholder that we'll update after generation to position the buttons
-            overlay_css = gr.HTML(value="", elem_id="viz_overlay_css")
-
-            # Pre-create a fixed number of buttons for inputs/outputs; we'll show/hide via CSS
-            max_input_buttons = 64
-            max_output_buttons = 64
-            input_buttons = []
-            output_buttons = []
-            for _i in range(max_input_buttons):
-                input_buttons.append(gr.Button(" ", elem_id=f"btn_in_{_i}", visible=True, size="sm"))
-            for _j in range(max_output_buttons):
-                output_buttons.append(gr.Button(" ", elem_id=f"btn_out_{_j}", visible=True, size="sm"))
-            reset_btn_overlay = gr.Button("Reset View (Overlay)", elem_id="btn_reset_overlay")
-        
-        # Hidden textbox for D3 click events
-        clicked_token_d3 = gr.Textbox(
-            visible=False, 
-            elem_id="clicked-token-d3"
-        )
-        
-        debug_info = gr.HTML(
-            """<div style="font-size: 12px; color: #555; margin-top: 10px;">
-            Click on any token to filter connections. D3.js visualization active.
-            </div>"""
-        )
+        # (Visualization output and overlay removed)
         
         # Instructions
         with gr.Accordion("📖 How to Use", open=False):
@@ -617,102 +573,57 @@ def create_gradio_interface():
             outputs=[model_status]
         )
         
-        def _generate_and_css(prompt, max_tokens, threshold, temperature, normalization):
-            fig, info, step, dropdown = app.generate_and_visualize(
-                prompt, max_tokens, threshold, temperature, normalization
+        def _generate(prompt, max_tokens, threshold, temperature):
+            info, = app.generate_and_visualize(
+                prompt, max_tokens, threshold, temperature, "separate"  # Always use separate normalization
             )
-            css = app.compute_overlay_css()
-            return fig, info, step, dropdown, css
+            
+            # Update visualization and dropdown choices
+            max_steps = len(app.current_data['attention_matrices']) - 1 if app.current_data else 0
+            viz_html = app.create_d3_visualization_html(step_idx=max_steps, threshold=0.01)  # Start with last step
+            token_choices = app.get_token_choices()
+            
+            return info, viz_html, gr.update(choices=token_choices, value="All tokens"), gr.update(maximum=max_steps, value=max_steps)
 
         generate_btn.click(
-            fn=_generate_and_css,
+            fn=_generate,
             inputs=[
                 prompt_input,
                 max_tokens_input,
-                threshold_input,
-                temperature_input,
-                normalization_input
+                gr.State(app.config.DEFAULT_THRESHOLD),  # keep threshold in call but unused
+                temperature_input
             ],
-            outputs=[viz_output, generated_info, step_slider, input_token_selector, overlay_css]
+            outputs=[generated_info, d3_visualization, token_dropdown, step_slider]
         )
         
-        def _update_step_and_css(step_value, threshold):
-            fig = app.update_step(step_value, threshold)
-            css = app.compute_overlay_css()
-            return fig, css
+        # Event handlers for visualization controls
+        def _update_visualization(step_idx, threshold, filter_token="All tokens"):
+            """Update visualization when step or threshold changes."""
+            viz_html = app.create_d3_visualization_html(step_idx=int(step_idx), threshold=threshold, filter_token=filter_token)
+            return viz_html
 
+        def _filter_by_token(selected_token, step_idx, threshold):
+            """Update visualization when token filter changes."""
+            viz_html = app.create_d3_visualization_html(step_idx=int(step_idx), threshold=threshold, filter_token=selected_token)
+            return viz_html
+
+        # Connect visualization controls
         step_slider.change(
-            fn=_update_step_and_css,
-            inputs=[step_slider, threshold_input],
-            outputs=[viz_output, overlay_css]
+            fn=_update_visualization,
+            inputs=[step_slider, threshold_slider, token_dropdown],
+            outputs=[d3_visualization]
         )
         
-        def _update_threshold_and_css(threshold, normalization):
-            fig = app.update_threshold(threshold, normalization)
-            css = app.compute_overlay_css()
-            return fig, css
-
-        threshold_input.change(
-            fn=_update_threshold_and_css,
-            inputs=[threshold_input, normalization_input],
-            outputs=[viz_output, overlay_css]
+        threshold_slider.change(
+            fn=_update_visualization,
+            inputs=[step_slider, threshold_slider, token_dropdown],
+            outputs=[d3_visualization]
         )
         
-        def _reset_and_css(threshold):
-            fig = app.reset_view(threshold)
-            css = app.compute_overlay_css()
-            return fig, css
-
-        reset_btn.click(
-            fn=_reset_and_css,
-            inputs=[threshold_input],
-            outputs=[viz_output, overlay_css]
-        )
-
-        # Overlay button click handlers (map to the same filtering path)
-        def _click_input_factory(idx: int):
-            return lambda thr: app.on_d3_token_click(json.dumps({"index": idx, "type": "input"}), thr)
-
-        def _click_output_factory(idx: int):
-            return lambda thr: app.on_d3_token_click(json.dumps({"index": idx, "type": "output"}), thr)
-
-        for _i, _btn in enumerate(input_buttons):
-            _btn.click(
-                fn=_click_input_factory(_i),
-                inputs=[threshold_input],
-                outputs=[viz_output, input_token_selector]
-            )
-
-        for _j, _btn in enumerate(output_buttons):
-            _btn.click(
-                fn=_click_output_factory(_j),
-                inputs=[threshold_input],
-                outputs=[viz_output, input_token_selector]
-            )
-
-        reset_btn_overlay.click(
-            fn=app.reset_view,
-            inputs=[threshold_input],
-            outputs=[viz_output]
-        )
-
-        # Dropdown selection to filter connections by input token
-        def _on_input_select_and_css(label, threshold):
-            fig = app.on_input_token_select(label, threshold)
-            css = app.compute_overlay_css()
-            return fig, css
-
-        input_token_selector.change(
-            fn=_on_input_select_and_css,
-            inputs=[input_token_selector, threshold_input],
-            outputs=[viz_output, overlay_css]
-        )
-        
-        # D3 click handler
-        clicked_token_d3.change(
-            fn=app.on_d3_token_click,
-            inputs=[clicked_token_d3, threshold_input],
-            outputs=[viz_output, input_token_selector]
+        token_dropdown.change(
+            fn=_filter_by_token,
+            inputs=[token_dropdown, step_slider, threshold_slider],
+            outputs=[d3_visualization]
         )
 
 

@@ -9,7 +9,7 @@ class Config:
     
     # Generation settings
     DEFAULT_MAX_TOKENS: int = 20
-    DEFAULT_PROMPT: str = "The old wizard walked through the forest"
+    DEFAULT_PROMPT: str = "The old wizard walked through the forest when he"
     DEFAULT_TEMPERATURE: float = 0.7
     DEFAULT_TOP_P: float = 0.95
     
